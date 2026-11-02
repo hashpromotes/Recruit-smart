@@ -29,19 +29,20 @@ import re
 import secrets
 import sqlite3
 import calendar
+from pathlib import Path
 from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from pathlib import Path
-
-LOGO = Path(__file__).parent / "logo.png"
-ICON = Path(__file__).parent / "icon.png"
+HERE = Path(__file__).parent
+LOGO = HERE / "logo.png"            # full logo with tagline  (login page)
+LOGO_WIDE = HERE / "logo_wide.png"  # compact horizontal logo (sidebar)
+ICON = HERE / "icon.png"            # square symbol           (browser tab / collapsed sidebar)
 
 st.set_page_config(
-    page_title="B/S/H/. InCount",
+    page_title="Incount · Recruitment Hub",
     page_icon=str(ICON) if ICON.exists() else "🧑‍💼",
     layout="wide",
 )
@@ -487,17 +488,13 @@ def login_view():
     with mid:
         st.write("")
         st.write("")
-               if LOGO.exists():
-            _, logo_col, _ = st.columns([1, 2, 1])
+        if LOGO.exists():
+            _, logo_col, _ = st.columns([1, 3, 1])
             logo_col.image(str(LOGO))
-            st.markdown("<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
-                        unsafe_allow_html=True)
         else:
-            st.markdown("<h1 style='text-align:center;margin-bottom:0'>🧑‍💼 Recruitment Hub</h1>"
-                        "<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
+            st.markdown("<h1 style='text-align:center;margin-bottom:0'>Incount</h1>"
+                        "<p style='text-align:center;opacity:.7'>Recruitment hub for external workforce.</p>",
                         unsafe_allow_html=True)
-                    "<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
-                    unsafe_allow_html=True)
         tab_in, tab_up = st.tabs(["Sign in", "Sign up"])
         with tab_in:
             signin_form()
@@ -507,7 +504,8 @@ def login_view():
 
 def sidebar_account(user):
     with st.sidebar:
-        st.markdown(f"### 🧑‍💼 Recruitment Hub\n**{user['full_name'] or user['username']}**  \n`{user['role']}`")
+        brand = "" if LOGO_WIDE.exists() else "### Incount\n"
+        st.markdown(f"{brand}**{user['full_name'] or user['username']}**  \n`{user['role']}`")
         with st.expander("Change password"):
             old = st.text_input("Current password", type="password", key="pw_old")
             new = st.text_input("New password (min 8 chars)", type="password", key="pw_new")
@@ -1618,8 +1616,11 @@ def main():
     msg = st.session_state.pop("flash", None)
     if msg:
         st.toast(msg)
-      if LOGO.exists():
-        st.logo(str(LOGO), icon_image=str(ICON) if ICON.exists() else None)
+    if LOGO_WIDE.exists():
+        try:
+            st.logo(str(LOGO_WIDE), size="large", icon_image=str(ICON) if ICON.exists() else None)
+        except TypeError:  # older Streamlit without the size / icon_image options
+            st.logo(str(LOGO_WIDE))
     sidebar_account(user)
     if user["role"] == "admin":
         n = run("SELECT COUNT(*) AS n FROM users WHERE approved=0", fetch=True)[0]["n"]
