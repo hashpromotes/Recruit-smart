@@ -35,7 +35,16 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="Recruitment Hub", page_icon="🧑‍💼", layout="wide")
+from pathlib import Path
+
+LOGO = Path(__file__).parent / "logo.png"
+ICON = Path(__file__).parent / "icon.png"
+
+st.set_page_config(
+    page_title="B/S/H/. InCount",
+    page_icon=str(ICON) if ICON.exists() else "🧑‍💼",
+    layout="wide",
+)
 
 st.markdown("""
 <style>
@@ -478,7 +487,15 @@ def login_view():
     with mid:
         st.write("")
         st.write("")
-        st.markdown("<h1 style='text-align:center;margin-bottom:0'>🧑‍💼 Recruitment Hub</h1>"
+               if LOGO.exists():
+            _, logo_col, _ = st.columns([1, 2, 1])
+            logo_col.image(str(LOGO))
+            st.markdown("<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
+                        unsafe_allow_html=True)
+        else:
+            st.markdown("<h1 style='text-align:center;margin-bottom:0'>🧑‍💼 Recruitment Hub</h1>"
+                        "<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
+                        unsafe_allow_html=True)
                     "<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
                     unsafe_allow_html=True)
         tab_in, tab_up = st.tabs(["Sign in", "Sign up"])
@@ -1601,6 +1618,8 @@ def main():
     msg = st.session_state.pop("flash", None)
     if msg:
         st.toast(msg)
+      if LOGO.exists():
+        st.logo(str(LOGO), icon_image=str(ICON) if ICON.exists() else None)
     sidebar_account(user)
     if user["role"] == "admin":
         n = run("SELECT COUNT(*) AS n FROM users WHERE approved=0", fetch=True)[0]["n"]
