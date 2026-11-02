@@ -1,0 +1,9 @@
+streamlit>=1.37
+pandas
+plotly
+scikit-learn
+pypdf
+python-docx
+# Optional - only needed for the LLM ranking options
+anthropic
+openai
