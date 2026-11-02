@@ -1,12 +1,13 @@
-
-"""===
+"""
 Vendor Recruitment Hub - Streamlit app
 ======================================
 Roles
   admin    : everything a manager can do + user management
   manager  : creates jobs, reviews candidates (shortlist / accept / reject),
              runs AI ranking, sees the vendor dashboard
-  vendor   : sees open jobs, uploads candidate resumes, tracks own submissions
+  vendor   : sees open jobs, uploads candidate resumes, tracks own submissions,
+             and sees APPROVED timesheets of the employees they supplied
+  employee : hired candidate - submits monthly timesheets, requests leave / WFH
 
 Run:
   pip install -r requirements.txt
@@ -27,12 +28,32 @@ import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime
+import calendar
+from datetime import date, datetime, timedelta
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 st.set_page_config(page_title="Recruitment Hub", page_icon="🧑‍💼", layout="wide")
+
+st.markdown("""
+<style>
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 2rem; max-width: 1200px;}
+[data-testid="stMetric"] {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128,128,128,.18);
+    border-radius: 14px; padding: 14px 18px;
+}
+[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 14px;}
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+    border-radius: 10px; font-weight: 600;
+}
+[data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
+button[data-baseweb="tab"] {font-weight: 600;}
+</style>
+""", unsafe_allow_html=True)
 
 DB_PATH = os.environ.get("RECRUIT_DB", "recruitment.db")
 STATUSES = ["Submitted", "Shortlisted", "Accepted", "Rejected"]
@@ -49,9 +70,11 @@ CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
   full_name TEXT, company TEXT,
-  role TEXT NOT NULL CHECK(role IN ('admin','manager','vendor')),
+  role TEXT NOT NULL CHECK(role IN ('admin','manager','vendor','employee')),
   pw_hash TEXT NOT NULL, salt TEXT NOT NULL,
-  active INTEGER DEFAULT 1, created_at TEXT
+  active INTEGER DEFAULT 1, created_at TEXT,
+  vendor_id INTEGER, candidate_id INTEGER, designation TEXT,
+  approved INTEGER DEFAULT 1       -- self sign-ups start at 0 until an admin approves
 );
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +92,24 @@ CREATE TABLE IF NOT EXISTS candidates(
   decided_by INTEGER, decided_at TEXT,
   ai_score REAL, ai_details TEXT, created_at TEXT,
   UNIQUE(job_id, email)
+);
+CREATE TABLE IF NOT EXISTS timesheets(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  employee_id INTEGER NOT NULL, month TEXT NOT NULL,          -- 'YYYY-MM'
+  status TEXT DEFAULT 'Draft',                                -- Draft/Submitted/Approved/Rejected
+  entries TEXT, total_hours REAL DEFAULT 0,                   -- entries = JSON list of daily rows
+  submitted_at TEXT, manager_note TEXT, decided_by INTEGER, decided_at TEXT,
+  created_at TEXT,
+  UNIQUE(employee_id, month)
+);
+CREATE TABLE IF NOT EXISTS requests(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  employee_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                                         -- 'Leave' or 'WFH'
+  leave_type TEXT, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+  days INTEGER, reason TEXT,
+  status TEXT DEFAULT 'Pending',                              -- Pending/Approved/Rejected/Cancelled
+  manager_note TEXT, decided_by INTEGER, decided_at TEXT, created_at TEXT
 );
 """
 
@@ -100,18 +141,38 @@ def verify_pw(password, pw_hash, salt):
     return hmac.compare_digest(hash_pw(password, salt)[0], pw_hash)
 
 
-def create_user(username, password, role, full_name="", company=""):
+def create_user(username, password, role, full_name="", company="",
+                vendor_id=None, candidate_id=None, designation="", approved=1):
     h, s = hash_pw(password)
     return run(
-        "INSERT INTO users(username,full_name,company,role,pw_hash,salt,created_at) VALUES(?,?,?,?,?,?,?)",
-        (username.strip(), full_name.strip(), company.strip(), role, h, s, now()),
+        """INSERT INTO users(username,full_name,company,role,pw_hash,salt,created_at,
+           vendor_id,candidate_id,designation,approved) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (username.strip(), full_name.strip(), company.strip(), role, h, s, now(),
+         vendor_id, candidate_id, designation, approved),
     )
+
+
+def migrate_users(conn):
+    """Older databases have a users table that doesn't allow the 'employee' role - rebuild it."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+    if row and "'employee'" not in row[0]:
+        conn.execute("ALTER TABLE users RENAME TO users_old")
+        conn.executescript(SCHEMA)  # recreates users with the new definition
+        cols = "id,username,full_name,company,role,pw_hash,salt,active,created_at"
+        conn.execute(f"INSERT INTO users({cols}) SELECT {cols} FROM users_old")
+        conn.execute("DROP TABLE users_old")
+        conn.commit()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    if "approved" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 1")
+        conn.commit()
 
 
 @st.cache_resource
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    migrate_users(conn)
     conn.commit()
     conn.close()
     if not run("SELECT id FROM users LIMIT 1", fetch=True):
@@ -272,51 +333,162 @@ def ai_evaluate(job, resume, methods):
 
 
 # --------------------------------------------------------------------------
+# UI helpers
+# --------------------------------------------------------------------------
+STATUS_COLORS = {"Submitted": "#F59E0B", "Shortlisted": "#3B82F6", "Accepted": "#10B981", "Rejected": "#EF4444"}
+REJECT_PRESETS = ["Skills mismatch", "Experience gap", "Salary expectation",
+                  "Location / notice period", "Position on hold", "Other"]
+
+
+def header(icon, title, subtitle=""):
+    st.title(f"{icon} {title}")
+    if subtitle:
+        st.caption(subtitle)
+
+
+def flash(msg):
+    """Show a toast on the next run (survives st.rerun)."""
+    st.session_state["flash"] = msg
+
+
+def style_fig(fig, height=360):
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=50, b=10), legend_title_text="",
+                      plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+# --------------------------------------------------------------------------
 # Auth
 # --------------------------------------------------------------------------
-def login_view():
-    st.title("🧑‍💼 Recruitment Hub")
-    _, mid, _ = st.columns([1, 1, 1])
-    with mid:
-        with st.form("login"):
-            u = st.text_input("Username")
-            p = st.text_input("Password", type="password")
-            if st.form_submit_button("Sign in"):
-                rows = run("SELECT * FROM users WHERE username=? AND active=1", (u.strip(),), fetch=True)
-                if rows and verify_pw(p, rows[0]["pw_hash"], rows[0]["salt"]):
+ROLE_CHOICES = {
+    "Hiring manager": "manager",
+    "Vendor": "vendor",
+    "Employee (hired through a vendor)": "employee",
+}
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
+
+
+def vendor_options():
+    """{vendor user id: display name} for approved, active vendors."""
+    rows = run("""SELECT id, COALESCE(NULLIF(company,''), NULLIF(full_name,''), username) AS name
+                  FROM users WHERE role='vendor' AND active=1 AND approved=1 ORDER BY name""", fetch=True)
+    return {r["id"]: r["name"] for r in rows}
+
+
+def signin_form():
+    with st.form("login"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", type="primary"):
+            rows = run("SELECT * FROM users WHERE username=? AND active=1", (u.strip(),), fetch=True)
+            if rows and verify_pw(p, rows[0]["pw_hash"], rows[0]["salt"]):
+                if not rows[0]["approved"]:
+                    st.warning("Your account is waiting for admin approval. Please check back later.")
+                else:
                     st.session_state.user = rows[0]
                     st.rerun()
-                else:
-                    st.error("Invalid credentials or inactive account.")
+            else:
+                st.error("Invalid credentials or inactive account.")
+
+
+def signup_form():
+    st.caption("Pick your role first - the form adapts to it. An admin reviews every new account "
+               "before it can be used.")
+    choice = st.selectbox("I'm signing up as a...", list(ROLE_CHOICES), index=None,
+                          placeholder="Select your role", key="su_role")
+    if not choice:
+        return
+    role = ROLE_CHOICES[choice]
+    vendors = vendor_options()
+
+    with st.form("signup", clear_on_submit=True):
+        full = st.text_input("Full name *")
+        company, designation, vendor_id = "", "", None
+        if role == "vendor":
+            company = st.text_input("Vendor company name *")
+        elif role == "employee":
+            if vendors:
+                vendor_id = st.selectbox("Vendor that placed you *", list(vendors), index=None,
+                                         format_func=lambda i: vendors[i], placeholder="Select your vendor")
+            else:
+                st.warning("No approved vendors exist yet. Ask your vendor to sign up first.")
+            designation = st.text_input("Job title / role *")
+        else:
+            company = st.text_input("Company / department")
+        username = st.text_input("Username *", help="3-32 characters: letters, numbers, . _ -")
+        pw = st.text_input("Password * (min 8 characters)", type="password")
+        pw2 = st.text_input("Confirm password *", type="password")
+
+        if st.form_submit_button("Create account", type="primary"):
+            uname = username.strip()
+            if not full.strip() or not uname or not pw:
+                st.error("Please fill in all required fields.")
+            elif not USERNAME_RE.match(uname):
+                st.error("Username must be 3-32 characters: letters, numbers, dot, dash or underscore.")
+            elif len(pw) < 8:
+                st.error("Password must be at least 8 characters.")
+            elif pw != pw2:
+                st.error("Passwords do not match.")
+            elif role == "vendor" and not company.strip():
+                st.error("Vendor company name is required.")
+            elif role == "employee" and (vendor_id is None or not designation.strip()):
+                st.error("Select the vendor that placed you and enter your job title.")
+            elif run("SELECT 1 FROM users WHERE lower(username)=lower(?)", (uname,), fetch=True):
+                st.error("That username is already taken.")
+            else:
+                try:
+                    create_user(uname, pw, role, full, company, vendor_id=vendor_id,
+                                designation=designation.strip(), approved=0)
+                    st.success("Account created! An admin needs to approve it before you can sign in.")
+                except sqlite3.IntegrityError:
+                    st.error("That username is already taken.")
+
+
+def login_view():
+    _, mid, _ = st.columns([1, 1.3, 1])
+    with mid:
+        st.write("")
+        st.write("")
+        st.markdown("<h1 style='text-align:center;margin-bottom:0'>🧑‍💼 Recruitment Hub</h1>"
+                    "<p style='text-align:center;opacity:.7'>Source, screen and hire - together with your vendors</p>",
+                    unsafe_allow_html=True)
+        tab_in, tab_up = st.tabs(["Sign in", "Sign up"])
+        with tab_in:
+            signin_form()
+        with tab_up:
+            signup_form()
 
 
 def sidebar_account(user):
-    st.sidebar.markdown(f"**{user['full_name'] or user['username']}**  \n`{user['role']}`")
-    with st.sidebar.expander("Change password"):
-        old = st.text_input("Current password", type="password", key="pw_old")
-        new = st.text_input("New password (min 8 chars)", type="password", key="pw_new")
-        if st.button("Update password"):
-            row = run("SELECT * FROM users WHERE id=?", (user["id"],), fetch=True)[0]
-            if not verify_pw(old, row["pw_hash"], row["salt"]):
-                st.error("Current password is wrong.")
-            elif len(new) < 8:
-                st.error("New password is too short.")
-            else:
-                h, s = hash_pw(new)
-                run("UPDATE users SET pw_hash=?, salt=? WHERE id=?", (h, s, user["id"]))
-                st.success("Password updated.")
-    if st.sidebar.button("Sign out"):
-        st.session_state.clear()
-        st.rerun()
+    with st.sidebar:
+        st.markdown(f"### 🧑‍💼 Recruitment Hub\n**{user['full_name'] or user['username']}**  \n`{user['role']}`")
+        with st.expander("Change password"):
+            old = st.text_input("Current password", type="password", key="pw_old")
+            new = st.text_input("New password (min 8 chars)", type="password", key="pw_new")
+            if st.button("Update password"):
+                row = run("SELECT * FROM users WHERE id=?", (user["id"],), fetch=True)[0]
+                if not verify_pw(old, row["pw_hash"], row["salt"]):
+                    st.error("Current password is wrong.")
+                elif len(new) < 8:
+                    st.error("New password is too short.")
+                else:
+                    h, s = hash_pw(new)
+                    run("UPDATE users SET pw_hash=?, salt=? WHERE id=?", (h, s, user["id"]))
+                    st.success("Password updated.")
+        if st.button("Sign out"):
+            st.session_state.clear()
+            st.rerun()
 
 
 # --------------------------------------------------------------------------
 # Manager / admin pages
 # --------------------------------------------------------------------------
 def page_jobs():
-    st.header("Job openings")
+    header("📋", "Job openings", "Create roles and track how vendors are responding")
     user = st.session_state.user
-    with st.expander("➕ Create a new job opportunity", expanded=False):
+    tab_list, tab_new = st.tabs(["All jobs", "➕ New job"])
+
+    with tab_new:
         with st.form("new_job", clear_on_submit=True):
             c1, c2 = st.columns(2)
             title = c1.text_input("Job title *")
@@ -328,7 +500,7 @@ def page_jobs():
             skills = st.text_area("Required skills (comma separated) - used by the keyword matcher",
                                   placeholder="python, sql, aws, stakeholder management")
             desc = st.text_area("Job description *", height=200)
-            if st.form_submit_button("Publish job"):
+            if st.form_submit_button("Publish job", type="primary"):
                 if not title.strip() or not desc.strip():
                     st.error("Title and description are required.")
                 else:
@@ -336,43 +508,101 @@ def page_jobs():
                            required_skills,description,openings,created_by,created_at)
                            VALUES(?,?,?,?,?,?,?,?,?,?)""",
                         (title.strip(), dept, loc, etype, exp, skills, desc, openings, user["id"], now()))
-                    st.success("Job published - vendors can now submit candidates.")
+                    flash("Job published - vendors can now submit candidates.")
                     st.rerun()
 
-    jobs = run("""SELECT j.*, (SELECT COUNT(*) FROM candidates c WHERE c.job_id=j.id) AS submissions,
-                  (SELECT COUNT(*) FROM candidates c WHERE c.job_id=j.id AND c.status='Accepted') AS accepted
-                  FROM jobs j ORDER BY j.id DESC""", fetch=True)
-    if not jobs:
-        st.info("No jobs yet.")
-        return
-    for j in jobs:
-        icon = "🟢" if j["status"] == "Open" else "⚪"
-        with st.expander(f"{icon} #{j['id']} · {j['title']} · {j['submissions']} submissions · "
-                         f"{j['accepted']}/{j['openings']} filled"):
-            st.write(f"**Dept:** {j['department'] or '-'} | **Location:** {j['location'] or '-'} | "
-                     f"**Type:** {j['employment_type']} | **Experience:** {j['experience'] or '-'}")
-            st.write(f"**Skills:** {j['required_skills'] or '-'}")
-            st.write(j["description"])
-            new_status = "Closed" if j["status"] == "Open" else "Open"
-            if st.button(f"{'Close' if new_status == 'Closed' else 'Reopen'} job", key=f"js{j['id']}"):
-                run("UPDATE jobs SET status=? WHERE id=?", (new_status, j["id"]))
-                st.rerun()
+    with tab_list:
+        jobs = run("""SELECT j.*, (SELECT COUNT(*) FROM candidates c WHERE c.job_id=j.id) AS submissions,
+                      (SELECT COUNT(*) FROM candidates c WHERE c.job_id=j.id AND c.status='Accepted') AS accepted
+                      FROM jobs j ORDER BY j.id DESC""", fetch=True)
+        if not jobs:
+            st.info("No jobs yet - create one in the 'New job' tab.")
+        for j in jobs:
+            with st.container(border=True):
+                top, btn = st.columns([5, 1])
+                top.markdown(f"#### {'🟢' if j['status'] == 'Open' else '⚪'} {j['title']}")
+                top.caption(f"#{j['id']} · {j['department'] or 'No dept'} · {j['location'] or 'No location'} · "
+                            f"{j['employment_type']} · {j['experience'] or 'Experience not set'}")
+                new_status = "Closed" if j["status"] == "Open" else "Open"
+                if btn.button("Close job" if new_status == "Closed" else "Reopen", key=f"js{j['id']}"):
+                    run("UPDATE jobs SET status=? WHERE id=?", (new_status, j["id"]))
+                    st.rerun()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Submissions", j["submissions"])
+                m2.metric("Accepted / openings", f"{j['accepted']} / {j['openings']}")
+                m3.write("")
+                m3.progress(min(1.0, j["accepted"] / max(1, j["openings"])), text="Positions filled")
+                with st.expander("Description & skills"):
+                    st.write(f"**Skills:** {j['required_skills'] or '-'}")
+                    st.write(j["description"])
 
 
-def decide(cid, status, reason=""):
+def decide(cid, status, reason="", name="Candidate"):
     run("UPDATE candidates SET status=?, decision_reason=?, decided_by=?, decided_at=? WHERE id=?",
         (status, reason, st.session_state.user["id"], now(), cid))
+    flash(f"{BADGE[status]} {name} moved to {status}")
     st.rerun()
 
 
+@st.dialog("Reject candidate")
+def reject_dialog(cid, name):
+    st.write(f"Why are you rejecting **{name}**? This feedback is shared with the vendor.")
+    preset = st.selectbox("Reason", REJECT_PRESETS)
+    note = st.text_area("Additional note (optional)")
+    if st.button("Confirm rejection", type="primary"):
+        decide(cid, "Rejected", preset + (f": {note.strip()}" if note.strip() else ""), name)
+
+
+def candidate_card(c, rank):
+    with st.container(border=True):
+        a, b, d = st.columns([3, 2, 3])
+        a.markdown(f"**#{rank} · {c['name']}**  \n{c['email']} · {c['phone'] or '-'}")
+        b.markdown(f"Vendor  \n**{c['vendor']}**")
+        if c["ai_score"] is not None:
+            d.progress(min(1.0, c["ai_score"] / 100), text=f"AI match {c['ai_score']:.0f}/100")
+        else:
+            d.caption("Not scored yet")
+        if c["decision_reason"]:
+            st.caption(f"📝 {c['decision_reason']}")
+
+        with st.expander("AI analysis & resume"):
+            if c["ai_details"]:
+                for r in json.loads(c["ai_details"]):
+                    s = "n/a" if r["score"] is None else f"{r['score']:.0f}"
+                    st.markdown(f"- **{r['method']}** ({s}): {r['note']}")
+            else:
+                st.caption("Run AI ranking to see analysis.")
+            row = run("SELECT resume_text, resume_blob FROM candidates WHERE id=?", (c["id"],), fetch=True)[0]
+            st.text_area("Resume text", row["resume_text"] or "", height=180, disabled=True, key=f"rt{c['id']}")
+            st.download_button("⬇ Download original resume", row["resume_blob"],
+                               file_name=c["resume_name"], key=f"dl{c['id']}")
+
+        b1, b2, b3, b4, _ = st.columns([1, 1, 1, 1, 2])
+        if b1.button("Shortlist", key=f"sl{c['id']}", disabled=c["status"] != "Submitted"):
+            decide(c["id"], "Shortlisted", "", c["name"])
+        if b2.button("Accept", key=f"ac{c['id']}", type="primary", disabled=c["status"] == "Accepted"):
+            decide(c["id"], "Accepted", "", c["name"])
+        if b3.button("Reject", key=f"rj{c['id']}", disabled=c["status"] == "Rejected"):
+            reject_dialog(c["id"], c["name"])
+        if c["status"] in ("Accepted", "Rejected") and b4.button("↩ Reopen", key=f"ro{c['id']}"):
+            decide(c["id"], "Submitted", "", c["name"])
+        if c["status"] == "Accepted":
+            emp = run("SELECT username FROM users WHERE candidate_id=?", (c["id"],), fetch=True)
+            if emp:
+                st.caption(f"✅ Employee login: `{emp[0]['username']}`")
+            elif st.button("🪪 Onboard as employee", key=f"ob{c['id']}"):
+                onboard_dialog(c)
+
+
 def page_review():
-    st.header("Candidate review")
+    header("🗂️", "Candidate review", "Rank, shortlist and decide")
     jobs = run("SELECT id,title,status FROM jobs ORDER BY id DESC", fetch=True)
     if not jobs:
         st.info("Create a job first.")
         return
     lookup = {j["id"]: j for j in jobs}
-    job_id = st.selectbox("Job", list(lookup), format_func=lambda i: f"#{i} · {lookup[i]['title']} ({lookup[i]['status']})")
+    job_id = st.selectbox("Job", list(lookup),
+                          format_func=lambda i: f"#{i} · {lookup[i]['title']} ({lookup[i]['status']})")
     job = run("SELECT * FROM jobs WHERE id=?", (job_id,), fetch=True)[0]
 
     # ---- AI ranking -------------------------------------------------------
@@ -381,12 +611,12 @@ def page_review():
                                  default=["Keyword skills match", "TF-IDF similarity"])
         st.caption("Keyword + TF-IDF run locally and free. Claude / GPT need an API key and give written reasoning.")
         rescore = st.checkbox("Also re-score candidates that already have a score")
-        if st.button("Run AI ranking", disabled=not methods):
+        if st.button("Run AI ranking", type="primary", disabled=not methods):
             targets = [c for c in fetch_candidates(job_id=job_id) if rescore or c["ai_score"] is None]
             if not targets:
                 st.info("Nothing to score.")
             else:
-                bar, failed = st.progress(0.0), 0
+                bar, failed = st.progress(0.0, text="Scoring..."), 0
                 for i, c in enumerate(targets):
                     text = run("SELECT resume_text FROM candidates WHERE id=?", (c["id"],), fetch=True)[0]["resume_text"] or ""
                     score, details = ai_evaluate(job, text, methods)
@@ -395,69 +625,44 @@ def page_review():
                     else:
                         run("UPDATE candidates SET ai_score=?, ai_details=? WHERE id=?",
                             (score, json.dumps(details), c["id"]))
-                    bar.progress((i + 1) / len(targets))
+                    bar.progress((i + 1) / len(targets), text=f"Scoring {i + 1}/{len(targets)}")
                 st.success(f"Scored {len(targets) - failed} candidate(s).")
                 if failed:
                     st.warning(f"{failed} failed - check API keys / installed packages.")
 
-    cands = fetch_candidates(job_id=job_id)
-    if not cands:
+    all_cands = fetch_candidates(job_id=job_id)
+    if not all_cands:
         st.info("No candidates submitted for this job yet.")
         return
 
-    # ---- Bulk action --------------------------------------------------------
-    with st.expander("⚡ Bulk reject low scorers"):
-        thr = st.slider("Reject 'Submitted' candidates scoring below", 0, 100, 30)
-        if st.button("Bulk reject"):
-            n = 0
-            for c in cands:
-                if c["status"] == "Submitted" and c["ai_score"] is not None and c["ai_score"] < thr:
-                    run("UPDATE candidates SET status='Rejected', decision_reason=?, decided_by=?, decided_at=? WHERE id=?",
-                        (f"Below AI screening threshold ({thr})", st.session_state.user["id"], now(), c["id"]))
-                    n += 1
-            st.success(f"Rejected {n} candidate(s).")
-            st.rerun()
+    q = st.text_input("🔍 Search by name, email or vendor", placeholder="Start typing...").strip().lower()
+    cands = [c for c in all_cands if not q or q in f"{c['name']} {c['email']} {c['vendor']}".lower()]
 
-    # ---- Candidate list -----------------------------------------------------
-    flt = st.multiselect("Show statuses", STATUSES, default=PENDING + ["Accepted", "Rejected"])
-    cands = sorted([c for c in cands if c["status"] in flt],
-                   key=lambda c: (c["ai_score"] is None, -(c["ai_score"] or 0)))
-    st.caption(f"{len(cands)} candidate(s), ranked by AI score")
-
-    for rank, c in enumerate(cands, 1):
-        score = f"{c['ai_score']:.0f}" if c["ai_score"] is not None else "-"
-        with st.expander(f"{BADGE[c['status']]} #{rank} · {c['name']} · AI {score}/100 · {c['vendor']} · {c['status']}"):
-            left, right = st.columns([2, 1])
-            with left:
-                st.write(f"📧 {c['email']}  📞 {c['phone'] or '-'}  🏢 Vendor: **{c['vendor']}**")
-                if c["ai_details"]:
-                    for d in json.loads(c["ai_details"]):
-                        s = "n/a" if d["score"] is None else f"{d['score']:.0f}"
-                        st.markdown(f"- **{d['method']}** ({s}): {d['note']}")
-                else:
-                    st.caption("Not scored yet.")
-                row = run("SELECT resume_text, resume_blob FROM candidates WHERE id=?", (c["id"],), fetch=True)[0]
-                st.text_area("Resume text", row["resume_text"] or "", height=160, disabled=True,
-                             key=f"rt{c['id']}")
-            with right:
-                st.download_button("⬇ Download resume", row["resume_blob"], file_name=c["resume_name"],
-                                   key=f"dl{c['id']}")
-                reason = st.text_input("Decision note / reject reason", value=c["decision_reason"] or "",
-                                       key=f"rs{c['id']}")
-                b1, b2, b3 = st.columns(3)
-                if b1.button("Shortlist", key=f"sl{c['id']}", disabled=c["status"] == "Shortlisted"):
-                    decide(c["id"], "Shortlisted", reason)
-                if b2.button("Accept", key=f"ac{c['id']}", disabled=c["status"] == "Accepted"):
-                    decide(c["id"], "Accepted", reason)
-                if b3.button("Reject", key=f"rj{c['id']}", disabled=c["status"] == "Rejected"):
-                    if reason.strip():
-                        decide(c["id"], "Rejected", reason)
-                    else:
-                        st.warning("Add a reason so the vendor gets feedback.")
+    tabs = st.tabs([f"{BADGE[s]} {s} ({sum(c['status'] == s for c in cands)})" for s in STATUSES])
+    for tab, status in zip(tabs, STATUSES):
+        with tab:
+            items = sorted([c for c in cands if c["status"] == status],
+                           key=lambda c: (c["ai_score"] is None, -(c["ai_score"] or 0)))
+            if status == "Submitted" and items:
+                with st.expander("⚡ Bulk reject low scorers"):
+                    thr = st.slider("Reject 'Submitted' candidates scoring below", 0, 100, 30)
+                    if st.button("Bulk reject"):
+                        n = 0
+                        for c in all_cands:
+                            if c["status"] == "Submitted" and c["ai_score"] is not None and c["ai_score"] < thr:
+                                run("UPDATE candidates SET status='Rejected', decision_reason=?, decided_by=?, decided_at=? WHERE id=?",
+                                    (f"Below AI screening threshold ({thr})", st.session_state.user["id"], now(), c["id"]))
+                                n += 1
+                        flash(f"Rejected {n} candidate(s) below {thr}")
+                        st.rerun()
+            if not items:
+                st.caption("Nothing here yet.")
+            for rank, c in enumerate(items, 1):
+                candidate_card(c, rank)
 
 
 def page_dashboard():
-    st.header("Vendor performance dashboard")
+    header("📊", "Vendor performance", "Acceptance and rejection rates by vendor")
     jobs = run("SELECT id,title FROM jobs ORDER BY id DESC", fetch=True)
     lookup = {0: "All jobs", **{j["id"]: f"#{j['id']} · {j['title']}" for j in jobs}}
     job_id = st.selectbox("Job filter", list(lookup), format_func=lambda i: lookup[i])
@@ -467,8 +672,8 @@ def page_dashboard():
         return
 
     total = len(df)
-    acc, rej = (df.status == "Accepted").sum(), (df.status == "Rejected").sum()
-    pend = df.status.isin(PENDING).sum()
+    acc, rej = int((df.status == "Accepted").sum()), int((df.status == "Rejected").sum())
+    pend = int(df.status.isin(PENDING).sum())
     m = st.columns(4)
     m[0].metric("Submitted", total)
     m[1].metric("Accepted", f"{acc}  ({acc / total:.0%})")
@@ -478,89 +683,162 @@ def page_dashboard():
     g = df.groupby("vendor")
     out = pd.DataFrame({
         "Submitted": g.size(),
-        "Pending": g.status.apply(lambda s: s.isin(PENDING).sum()),
-        "Accepted": g.status.apply(lambda s: (s == "Accepted").sum()),
-        "Rejected": g.status.apply(lambda s: (s == "Rejected").sum()),
+        "Pending": g.status.apply(lambda s: int(s.isin(PENDING).sum())),
+        "Accepted": g.status.apply(lambda s: int((s == "Accepted").sum())),
+        "Rejected": g.status.apply(lambda s: int((s == "Rejected").sum())),
         "Avg AI score": g.ai_score.mean().round(1),
     })
     out["Accepted %"] = (out["Accepted"] / out["Submitted"] * 100).round(1)
     out["Rejected %"] = (out["Rejected"] / out["Submitted"] * 100).round(1)
     decided = (out["Accepted"] + out["Rejected"]).where(lambda x: x > 0)
     out["Acceptance % of decided"] = (out["Accepted"] / decided * 100).round(1)
-    out = out.sort_values("Accepted %", ascending=False)
+    out = out.sort_values("Accepted %", ascending=False).reset_index().rename(columns={"vendor": "Vendor"})
 
     st.subheader("By vendor")
-    st.dataframe(out)
+    pct = lambda label: st.column_config.ProgressColumn(label, min_value=0, max_value=100, format="%.1f")
+    st.dataframe(out, hide_index=True, column_config={
+        "Accepted %": pct("Accepted %"),
+        "Rejected %": pct("Rejected %"),
+        "Acceptance % of decided": pct("Acceptance % of decided"),
+        "Avg AI score": pct("Avg AI score"),
+    })
     st.caption("Accepted % / Rejected % are out of everything the vendor submitted; "
                "'Acceptance % of decided' ignores candidates still pending.")
-    st.bar_chart(out[["Accepted %", "Rejected %"]])
 
-    st.subheader("Submissions per job")
-    st.dataframe(df.groupby("job_title").status.value_counts().unstack(fill_value=0))
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        fig = px.bar(out, x="Vendor", y=["Accepted %", "Rejected %"], barmode="group", text_auto=".1f",
+                     color_discrete_map={"Accepted %": STATUS_COLORS["Accepted"], "Rejected %": STATUS_COLORS["Rejected"]},
+                     labels={"value": "% of submitted", "variable": ""}, title="Accepted vs rejected % by vendor")
+        st.plotly_chart(style_fig(fig))
+    with c2:
+        mix = df.groupby("status").size().reset_index(name="count")
+        fig = px.pie(mix, names="status", values="count", hole=0.55, color="status",
+                     color_discrete_map=STATUS_COLORS, title="Overall status mix")
+        st.plotly_chart(style_fig(fig))
 
-    st.subheader("Submissions over time")
-    df["day"] = pd.to_datetime(df.created_at).dt.date
-    st.line_chart(df.groupby("day").size())
+    mix_v = df.groupby(["vendor", "status"]).size().reset_index(name="count")
+    fig = px.bar(mix_v, x="vendor", y="count", color="status", color_discrete_map=STATUS_COLORS,
+                 category_orders={"status": STATUSES}, labels={"vendor": "Vendor", "count": "Candidates"},
+                 title="Pipeline by vendor")
+    st.plotly_chart(style_fig(fig, 340))
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.subheader("Submissions per job")
+        st.dataframe(df.groupby("job_title").status.value_counts().unstack(fill_value=0))
+    with c4:
+        st.subheader("Submissions over time")
+        df["day"] = pd.to_datetime(df.created_at).dt.date
+        st.line_chart(df.groupby("day").size())
 
 
 def page_users():
-    st.header("User management")
-    with st.form("new_user", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        username = c1.text_input("Username *")
-        role = c2.selectbox("Role", ["manager", "vendor", "admin"])
-        full = c1.text_input("Full name")
-        company = c2.text_input("Vendor company (for vendors)")
-        pw = st.text_input("Temporary password * (min 8 chars)", type="password")
-        if st.form_submit_button("Create user"):
-            if not username.strip() or len(pw) < 8:
-                st.error("Username and a password of 8+ characters are required.")
-            elif role == "vendor" and not (company.strip() or full.strip()):
-                st.error("Vendors need a company or full name (shown on the dashboard).")
-            else:
-                try:
-                    create_user(username, pw, role, full, company)
-                    st.success(f"Created {role} '{username}'.")
-                except sqlite3.IntegrityError:
-                    st.error("That username already exists.")
+    header("👥", "User management", "Approve sign-ups and manage logins")
+    pending = run("SELECT * FROM users WHERE approved=0 ORDER BY created_at", fetch=True)
+    all_vendors = {r["id"]: r["name"] for r in run(
+        """SELECT id, COALESCE(NULLIF(company,''), NULLIF(full_name,''), username) AS name
+           FROM users WHERE role='vendor'""", fetch=True)}
+    tab_list, tab_pending, tab_new = st.tabs(["Users", f"🕓 Pending sign-ups ({len(pending)})", "➕ Add user"])
 
-    users = run("SELECT id,username,full_name,company,role,active,created_at FROM users ORDER BY id", fetch=True)
-    st.dataframe(pd.DataFrame(users))
-    lookup = {u["id"]: u for u in users}
-    uid = st.selectbox("Manage user", list(lookup), format_func=lambda i: f"{lookup[i]['username']} ({lookup[i]['role']})")
-    c1, c2 = st.columns(2)
-    if uid != st.session_state.user["id"]:
-        label = "Deactivate" if lookup[uid]["active"] else "Activate"
-        if c1.button(label):
-            run("UPDATE users SET active=? WHERE id=?", (0 if lookup[uid]["active"] else 1, uid))
-            st.rerun()
-    new_pw = c2.text_input("New password", type="password", key="reset_pw")
-    if c2.button("Reset password"):
-        if len(new_pw) < 8:
-            st.error("Min 8 characters.")
-        else:
-            h, s = hash_pw(new_pw)
-            run("UPDATE users SET pw_hash=?, salt=? WHERE id=?", (h, s, uid))
-            st.success("Password reset.")
+    with tab_pending:
+        if not pending:
+            st.caption("No sign-ups waiting for approval.")
+        for u in pending:
+            with st.container(border=True):
+                a, b, c = st.columns([5, 1, 1])
+                if u["role"] == "employee":
+                    detail = f"Vendor: **{all_vendors.get(u['vendor_id'], 'unknown')}** · Title: {u['designation'] or '-'}"
+                else:
+                    detail = f"Company: {u['company'] or '-'}"
+                a.markdown(f"**{u['full_name']}** (`{u['username']}`) · requested role: **{u['role']}**  \n"
+                           f"{detail} · signed up {u['created_at']}")
+                if b.button("Approve", key=f"ap{u['id']}", type="primary"):
+                    run("UPDATE users SET approved=1 WHERE id=?", (u["id"],))
+                    flash(f"✅ {u['username']} approved as {u['role']}")
+                    st.rerun()
+                if c.button("Reject", key=f"rjs{u['id']}"):
+                    run("DELETE FROM users WHERE id=? AND approved=0", (u["id"],))
+                    flash(f"🗑️ Sign-up from {u['username']} rejected")
+                    st.rerun()
+
+    with tab_new:
+        vendors = vendor_options()
+        with st.form("new_user", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            username = c1.text_input("Username *")
+            role = c2.selectbox("Role", ["manager", "vendor", "employee", "admin"])
+            full = c1.text_input("Full name")
+            company = c2.text_input("Vendor company (for vendors)")
+            vendor_id = None
+            if vendors:
+                vendor_id = c1.selectbox("Supplying vendor (employees only)", list(vendors), index=None,
+                                         format_func=lambda i: vendors[i], placeholder="Select vendor")
+            designation = c2.text_input("Job title (employees only)")
+            pw = st.text_input("Temporary password * (min 8 chars)", type="password")
+            if st.form_submit_button("Create user", type="primary"):
+                if not username.strip() or len(pw) < 8:
+                    st.error("Username and a password of 8+ characters are required.")
+                elif role == "vendor" and not (company.strip() or full.strip()):
+                    st.error("Vendors need a company or full name (shown on the dashboard).")
+                elif role == "employee" and vendor_id is None:
+                    st.error("Employees must be linked to a supplying vendor.")
+                else:
+                    try:
+                        create_user(username, pw, role, full, company,
+                                    vendor_id=vendor_id if role == "employee" else None,
+                                    designation=designation if role == "employee" else "")
+                        st.success(f"Created {role} '{username}'.")
+                    except sqlite3.IntegrityError:
+                        st.error("That username already exists.")
+
+    with tab_list:
+        users = run("""SELECT id,username,full_name,company,role,active,approved,vendor_id,designation,created_at
+                       FROM users ORDER BY id""", fetch=True)
+        df = pd.DataFrame(users)
+        df["vendor"] = df.vendor_id.map(lambda v: all_vendors.get(v, "") if pd.notna(v) else "")
+        st.dataframe(df.drop(columns=["vendor_id"]), hide_index=True)
+        lookup = {u["id"]: u for u in users}
+        with st.container(border=True):
+            uid = st.selectbox("Manage user", list(lookup),
+                               format_func=lambda i: f"{lookup[i]['username']} ({lookup[i]['role']})")
+            c1, c2 = st.columns(2)
+            if uid != st.session_state.user["id"]:
+                label = "Deactivate" if lookup[uid]["active"] else "Activate"
+                if c1.button(label):
+                    run("UPDATE users SET active=? WHERE id=?", (0 if lookup[uid]["active"] else 1, uid))
+                    st.rerun()
+            new_pw = c2.text_input("New password", type="password", key="reset_pw")
+            if c2.button("Reset password"):
+                if len(new_pw) < 8:
+                    st.error("Min 8 characters.")
+                else:
+                    h, s = hash_pw(new_pw)
+                    run("UPDATE users SET pw_hash=?, salt=? WHERE id=?", (h, s, uid))
+                    st.success("Password reset.")
 
 
 # --------------------------------------------------------------------------
 # Vendor pages
 # --------------------------------------------------------------------------
 def page_vendor_submit():
-    st.header("Submit candidates")
+    header("📤", "Submit candidates", "Pick an open role and upload a resume")
     user = st.session_state.user
     jobs = run("SELECT * FROM jobs WHERE status='Open' ORDER BY id DESC", fetch=True)
     if not jobs:
         st.info("There are no open jobs right now.")
         return
     lookup = {j["id"]: j for j in jobs}
-    jid = st.selectbox("Open job", list(lookup), format_func=lambda i: f"#{i} · {lookup[i]['title']} - {lookup[i]['location'] or ''}")
+    jid = st.selectbox("Open job", list(lookup),
+                       format_func=lambda i: f"#{i} · {lookup[i]['title']} - {lookup[i]['location'] or ''}")
     j = lookup[jid]
-    with st.expander("Job details", expanded=True):
-        st.write(f"**Experience:** {j['experience'] or '-'} | **Type:** {j['employment_type']} | **Openings:** {j['openings']}")
+    with st.container(border=True):
+        st.markdown(f"#### {j['title']}")
+        st.caption(f"{j['employment_type']} · {j['experience'] or 'Experience not set'} · "
+                   f"{j['openings']} opening(s) · {j['location'] or 'Location not set'}")
         st.write(f"**Skills:** {j['required_skills'] or '-'}")
-        st.write(j["description"])
+        with st.expander("Full job description"):
+            st.write(j["description"])
 
     with st.form("submit_candidate", clear_on_submit=True):
         c1, c2 = st.columns(2)
@@ -568,7 +846,7 @@ def page_vendor_submit():
         email = c2.text_input("Candidate email *")
         phone = c1.text_input("Phone")
         f = st.file_uploader("Resume (PDF, DOCX or TXT) *", type=["pdf", "docx", "txt"])
-        if st.form_submit_button("Submit candidate"):
+        if st.form_submit_button("Submit candidate", type="primary"):
             if not name.strip() or not email.strip() or f is None:
                 st.error("Name, email and resume are required.")
             elif f.size > MAX_UPLOAD_MB * 1024 * 1024:
@@ -589,28 +867,421 @@ def page_vendor_submit():
 
 
 def page_vendor_mine():
-    st.header("My submissions")
+    header("📁", "My submissions", "Track the status of every candidate you've sent")
     rows = fetch_candidates(vendor_id=st.session_state.user["id"])
     if not rows:
         st.info("You haven't submitted any candidates yet.")
         return
     df = pd.DataFrame(rows)[["job_title", "name", "email", "status", "decision_reason", "created_at", "decided_at"]]
-    df.columns = ["Job", "Candidate", "Email", "Status", "Manager feedback", "Submitted", "Decided"]
-    st.dataframe(df)
     total = len(df)
-    c = st.columns(3)
+    c = st.columns(4)
     c[0].metric("Submitted", total)
-    c[1].metric("Accepted", (df.Status == "Accepted").sum())
-    c[2].metric("Rejected", (df.Status == "Rejected").sum())
+    c[1].metric("Pending", int(df.status.isin(PENDING).sum()))
+    c[2].metric("Accepted", int((df.status == "Accepted").sum()))
+    c[3].metric("Rejected", int((df.status == "Rejected").sum()))
+    df["status"] = df.status.map(lambda s: f"{BADGE[s]} {s}")
+    df.columns = ["Job", "Candidate", "Email", "Status", "Manager feedback", "Submitted", "Decided"]
+    st.dataframe(df, hide_index=True)
+
+
+# --------------------------------------------------------------------------
+# Employees: onboarding, timesheets, leave / WFH, approvals
+# --------------------------------------------------------------------------
+TS_BADGE = {"Not started": "⚪", "Draft": "📝", "Submitted": "🟡", "Approved": "🟢", "Rejected": "🔴"}
+RQ_BADGE = {"Pending": "🟡", "Approved": "🟢", "Rejected": "🔴", "Cancelled": "⚪"}
+DAY_TYPES = ["Office", "WFH", "Leave", "Holiday", "Off"]
+LEAVE_TYPES = ["Casual", "Sick", "Annual", "Unpaid", "Other"]
+
+
+def month_options(n=6):
+    d = date.today()
+    y, m, out = d.year, d.month, []
+    for _ in range(n):
+        out.append(f"{y}-{m:02d}")
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return out
+
+
+def month_label(ym):
+    y, m = map(int, ym.split("-"))
+    return f"{calendar.month_name[m]} {y}"
+
+
+def count_workdays(start, end):
+    d, n = start, 0
+    while d <= end:
+        if d.weekday() < 5:
+            n += 1
+        d += timedelta(days=1)
+    return n
+
+
+def approved_days(emp_id, ym):
+    """{iso date: 'Leave' | 'WFH'} for approved requests that touch this month (weekdays only)."""
+    y, m = map(int, ym.split("-"))
+    first, last = date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+    rows = run("""SELECT kind,start_date,end_date FROM requests
+                  WHERE employee_id=? AND status='Approved' AND start_date<=? AND end_date>=?""",
+               (emp_id, last.isoformat(), first.isoformat()), fetch=True)
+    out = {}
+    for r in rows:
+        d = max(date.fromisoformat(r["start_date"]), first)
+        end = min(date.fromisoformat(r["end_date"]), last)
+        while d <= end:
+            if d.weekday() < 5:
+                out[d.isoformat()] = r["kind"]
+            d += timedelta(days=1)
+    return out
+
+
+def default_grid(emp_id, ym):
+    y, m = map(int, ym.split("-"))
+    marks = approved_days(emp_id, ym)
+    rows = []
+    for day in range(1, calendar.monthrange(y, m)[1] + 1):
+        d = date(y, m, day)
+        iso = d.isoformat()
+        if d.weekday() >= 5:
+            typ, hrs = "Off", 0.0
+        elif iso in marks:
+            typ = marks[iso]
+            hrs = 0.0 if typ == "Leave" else 8.0
+        else:
+            typ, hrs = "Office", 8.0
+        rows.append({"Date": iso, "Day": d.strftime("%a"), "Type": typ, "Hours": hrs, "Notes": ""})
+    return pd.DataFrame(rows)
+
+
+def ts_summary(entries):
+    df = pd.DataFrame(entries)
+    if df.empty:
+        return {"hours": 0.0, "office": 0, "wfh": 0, "leave": 0}
+    h = df["Hours"].fillna(0)
+    return {"hours": float(h.sum()),
+            "office": int(((df["Type"] == "Office") & (h > 0)).sum()),
+            "wfh": int(((df["Type"] == "WFH") & (h > 0)).sum()),
+            "leave": int((df["Type"] == "Leave").sum())}
+
+
+def save_timesheet(emp_id, ym, df, submit):
+    entries = json.loads(df.fillna({"Hours": 0, "Notes": ""}).to_json(orient="records"))
+    total = round(sum(float(e["Hours"]) for e in entries), 2)
+    cur = run("SELECT id FROM timesheets WHERE employee_id=? AND month=?", (emp_id, ym), fetch=True)
+    if not cur:
+        run("""INSERT INTO timesheets(employee_id,month,status,entries,total_hours,submitted_at,created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (emp_id, ym, "Submitted" if submit else "Draft", json.dumps(entries), total,
+             now() if submit else None, now()))
+    elif submit:
+        run("""UPDATE timesheets SET entries=?, total_hours=?, status='Submitted', submitted_at=?,
+               manager_note=NULL, decided_by=NULL, decided_at=NULL WHERE id=?""",
+            (json.dumps(entries), total, now(), cur[0]["id"]))
+    else:  # draft save keeps the current status (Draft, or Rejected while the employee fixes it)
+        run("UPDATE timesheets SET entries=?, total_hours=? WHERE id=?", (json.dumps(entries), total, cur[0]["id"]))
+
+
+# ---- onboarding (manager / admin) ----------------------------------------
+@st.dialog("Onboard as employee")
+def onboard_dialog(c):
+    st.write(f"Create a login for **{c['name']}**, supplied by **{c['vendor']}**.")
+    default = re.sub(r"[^a-z0-9.]", "", c["name"].lower().replace(" ", "."))
+    username = st.text_input("Username", value=default)
+    pw = st.text_input("Temporary password (min 8 chars)", type="password")
+    st.caption("Share these credentials with the employee; they can change the password after signing in.")
+    if st.button("Create employee login", type="primary"):
+        if not username.strip() or len(pw) < 8:
+            st.error("Username and a password of 8+ characters are required.")
+        else:
+            try:
+                create_user(username, pw, "employee", c["name"], c["vendor"], vendor_id=c["vendor_id"],
+                            candidate_id=c["id"], designation=c["job_title"])
+                flash(f"🪪 Employee login created for {c['name']}")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("That username already exists.")
+
+
+# ---- employee pages --------------------------------------------------------
+def page_emp_timesheet():
+    header("🗓️", "My timesheet", "Fill in your hours for the month and submit for approval")
+    user = st.session_state.user
+    ym = st.selectbox("Month", month_options(), format_func=month_label)
+    found = run("SELECT * FROM timesheets WHERE employee_id=? AND month=?", (user["id"], ym), fetch=True)
+    ts = found[0] if found else None
+    status = ts["status"] if ts else "Not started"
+    st.markdown(f"**Status:** {TS_BADGE[status]} {status}")
+    if status == "Rejected" and ts["manager_note"]:
+        st.warning(f"Your manager sent this back: {ts['manager_note']}")
+    if status == "Approved":
+        st.success(f"Approved on {ts['decided_at']}. This timesheet is now visible to your vendor.")
+    elif status == "Submitted":
+        st.info("Submitted - waiting for your manager's approval.")
+    locked = status in ("Submitted", "Approved")
+
+    df = pd.DataFrame(json.loads(ts["entries"])) if ts else default_grid(user["id"], ym)
+    if not ts:
+        st.caption("Pre-filled with 8h on weekdays; approved leave / WFH days are marked for you. Adjust as needed.")
+    edited = st.data_editor(
+        df, key=f"ts_{ym}_{status}", hide_index=True, num_rows="fixed",
+        disabled=True if locked else ["Date", "Day"],
+        column_config={
+            "Type": st.column_config.SelectboxColumn("Type", options=DAY_TYPES, required=True),
+            "Hours": st.column_config.NumberColumn("Hours", min_value=0, max_value=24, step=0.5, format="%.1f"),
+            "Notes": st.column_config.TextColumn("Notes", width="large"),
+        },
+    )
+    s = ts_summary(json.loads(edited.fillna({"Hours": 0, "Notes": ""}).to_json(orient="records")))
+    m = st.columns(4)
+    m[0].metric("Total hours", f"{s['hours']:.1f}")
+    m[1].metric("Office days", s["office"])
+    m[2].metric("WFH days", s["wfh"])
+    m[3].metric("Leave days", s["leave"])
+
+    if not locked:
+        c1, c2, _ = st.columns([1, 1.5, 3])
+        if c1.button("💾 Save draft"):
+            save_timesheet(user["id"], ym, edited, submit=False)
+            flash("Draft saved")
+            st.rerun()
+        if c2.button("📨 Submit for approval", type="primary"):
+            hrs = edited["Hours"].fillna(0)
+            bad = edited[edited["Type"].isin(["Leave", "Holiday", "Off"]) & (hrs > 0)]
+            if s["hours"] <= 0:
+                st.error("Enter your hours before submitting.")
+            elif not bad.empty:
+                st.error("Hours entered on Leave / Holiday / Off days: " + ", ".join(bad["Date"]) +
+                         ". Change the Type or set hours to 0.")
+            else:
+                save_timesheet(user["id"], ym, edited, submit=True)
+                flash("📨 Timesheet submitted for approval")
+                st.rerun()
+
+
+def page_emp_requests():
+    header("🏠", "Leave & WFH", "Request time off or a work-from-home period")
+    user = st.session_state.user
+    mine = run("SELECT * FROM requests WHERE employee_id=? ORDER BY id DESC", (user["id"],), fetch=True)
+    yr, ym = str(date.today().year), date.today().strftime("%Y-%m")
+    leave_days = sum(r["days"] or 0 for r in mine
+                     if r["kind"] == "Leave" and r["status"] == "Approved" and r["start_date"].startswith(yr))
+    wfh_days = sum(r["days"] or 0 for r in mine
+                   if r["kind"] == "WFH" and r["status"] == "Approved" and r["start_date"].startswith(ym))
+    m = st.columns(3)
+    m[0].metric("Approved leave days (this year)", leave_days)
+    m[1].metric("Approved WFH days (this month)", wfh_days)
+    m[2].metric("Pending requests", sum(r["status"] == "Pending" for r in mine))
+
+    tab_new, tab_hist = st.tabs(["➕ New request", "My requests"])
+    with tab_new:
+        with st.form("new_req", clear_on_submit=True):
+            kind = st.radio("Request type", ["Leave", "WFH"], horizontal=True,
+                            format_func=lambda k: "Leave" if k == "Leave" else "Work from home")
+            leave_type = st.selectbox("Leave type (leave requests only)", LEAVE_TYPES)
+            c1, c2 = st.columns(2)
+            start = c1.date_input("From", value=date.today())
+            end = c2.date_input("To", value=date.today())
+            reason = st.text_area("Reason")
+            if st.form_submit_button("Submit request", type="primary"):
+                if end < start:
+                    st.error("The end date is before the start date.")
+                elif count_workdays(start, end) == 0:
+                    st.error("The selected dates are all weekend days.")
+                elif not reason.strip():
+                    st.error("Please add a short reason.")
+                elif run("""SELECT 1 FROM requests WHERE employee_id=? AND status IN ('Pending','Approved')
+                            AND start_date<=? AND end_date>=?""",
+                         (user["id"], end.isoformat(), start.isoformat()), fetch=True):
+                    st.error("You already have a pending or approved request overlapping these dates.")
+                else:
+                    run("""INSERT INTO requests(employee_id,kind,leave_type,start_date,end_date,days,reason,created_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (user["id"], kind, leave_type if kind == "Leave" else None, start.isoformat(),
+                         end.isoformat(), count_workdays(start, end), reason.strip(), now()))
+                    flash("📨 Request sent to your manager")
+                    st.rerun()
+
+    with tab_hist:
+        if not mine:
+            st.info("No requests yet.")
+        for r in [x for x in mine if x["status"] == "Pending"]:
+            with st.container(border=True):
+                a, b = st.columns([5, 1])
+                label = "Work from home" if r["kind"] == "WFH" else f"{r['leave_type']} leave"
+                a.markdown(f"🟡 **{label}** · {r['start_date']} → {r['end_date']} · {r['days']} working day(s)  \n{r['reason']}")
+                if b.button("Cancel", key=f"cn{r['id']}"):
+                    run("UPDATE requests SET status='Cancelled' WHERE id=? AND employee_id=?", (r["id"], user["id"]))
+                    flash("Request cancelled")
+                    st.rerun()
+        done = [r for r in mine if r["status"] != "Pending"]
+        if done:
+            st.subheader("History")
+            hist = pd.DataFrame([{
+                "Type": "WFH" if r["kind"] == "WFH" else f"{r['leave_type']} leave",
+                "From": r["start_date"], "To": r["end_date"], "Days": r["days"],
+                "Status": f"{RQ_BADGE[r['status']]} {r['status']}", "Manager note": r["manager_note"] or "",
+            } for r in done])
+            st.dataframe(hist, hide_index=True)
+
+
+# ---- manager / admin approvals --------------------------------------------
+TS_SQL = """SELECT t.*, COALESCE(NULLIF(e.full_name,''), e.username) AS employee,
+            COALESCE(NULLIF(v.company,''), NULLIF(v.full_name,''), v.username, '-') AS vendor
+            FROM timesheets t JOIN users e ON e.id=t.employee_id LEFT JOIN users v ON v.id=e.vendor_id"""
+RQ_SQL = """SELECT r.*, COALESCE(NULLIF(e.full_name,''), e.username) AS employee,
+            COALESCE(NULLIF(v.company,''), NULLIF(v.full_name,''), v.username, '-') AS vendor
+            FROM requests r JOIN users e ON e.id=r.employee_id LEFT JOIN users v ON v.id=e.vendor_id"""
+
+
+def decide_item(table, item_id, status, note, label):
+    # table is always a hard-coded literal from this module, never user input
+    run(f"UPDATE {table} SET status=?, manager_note=?, decided_by=?, decided_at=? WHERE id=?",
+        (status, note, st.session_state.user["id"], now(), item_id))
+    flash(f"{label} {status.lower()}")
+    st.rerun()
+
+
+@st.dialog("Reject")
+def reject_item_dialog(table, item_id, label):
+    st.write(f"Rejecting **{label}**. The employee will see your note.")
+    note = st.text_area("Reason *")
+    if st.button("Confirm rejection", type="primary"):
+        if not note.strip():
+            st.error("A reason is required.")
+        else:
+            decide_item(table, item_id, "Rejected", note.strip(), label)
+
+
+def page_approvals():
+    header("✅", "Approvals", "Review timesheets and leave / WFH requests")
+    pend_ts = run(TS_SQL + " WHERE t.status='Submitted' ORDER BY t.submitted_at", fetch=True)
+    pend_rq = run(RQ_SQL + " WHERE r.status='Pending' ORDER BY r.created_at", fetch=True)
+    tab_ts, tab_rq, tab_hist = st.tabs([f"🗓️ Timesheets ({len(pend_ts)})",
+                                        f"🏠 Leave & WFH ({len(pend_rq)})", "📜 History"])
+
+    with tab_ts:
+        if not pend_ts:
+            st.caption("No timesheets waiting for approval.")
+        for t in pend_ts:
+            entries, who = json.loads(t["entries"]), t["employee"]
+            s = ts_summary(entries)
+            with st.container(border=True):
+                a, b = st.columns([3, 2])
+                a.markdown(f"**{who}** · {month_label(t['month'])}  \nVendor: {t['vendor']} · submitted {t['submitted_at']}")
+                b.markdown(f"**{s['hours']:.1f} h**  \n{s['office']} office · {s['wfh']} WFH · {s['leave']} leave")
+                with st.expander("Daily breakdown"):
+                    st.dataframe(pd.DataFrame(entries), hide_index=True)
+                x, y, _ = st.columns([1, 1, 4])
+                label = f"{who}'s {month_label(t['month'])} timesheet"
+                if x.button("Approve", key=f"tsa{t['id']}", type="primary"):
+                    decide_item("timesheets", t["id"], "Approved", "", label)
+                if y.button("Reject", key=f"tsr{t['id']}"):
+                    reject_item_dialog("timesheets", t["id"], label)
+
+    with tab_rq:
+        if not pend_rq:
+            st.caption("No requests waiting for approval.")
+        for r in pend_rq:
+            kind = "Work from home" if r["kind"] == "WFH" else f"{r['leave_type']} leave"
+            with st.container(border=True):
+                st.markdown(f"**{r['employee']}** · {kind}  \nVendor: {r['vendor']} · "
+                            f"{r['start_date']} → {r['end_date']} · **{r['days']} working day(s)**")
+                st.caption(f"Reason: {r['reason']}")
+                x, y, _ = st.columns([1, 1, 4])
+                label = f"{r['employee']}'s {kind} request"
+                if x.button("Approve", key=f"rqa{r['id']}", type="primary"):
+                    decide_item("requests", r["id"], "Approved", "", label)
+                if y.button("Reject", key=f"rqr{r['id']}"):
+                    reject_item_dialog("requests", r["id"], label)
+
+    with tab_hist:
+        st.subheader("Recent timesheet decisions")
+        done_ts = run(TS_SQL + " WHERE t.status IN ('Approved','Rejected') ORDER BY t.decided_at DESC LIMIT 30", fetch=True)
+        if not done_ts:
+            st.caption("Nothing yet.")
+        for t in done_ts:
+            with st.container(border=True):
+                a, b = st.columns([5, 1])
+                a.markdown(f"{TS_BADGE[t['status']]} **{t['employee']}** · {month_label(t['month'])} · "
+                           f"{t['total_hours']:.1f} h · {t['status']} {t['decided_at']}"
+                           + (f"  \n📝 {t['manager_note']}" if t["manager_note"] else ""))
+                if t["status"] == "Approved" and b.button("↩ Revoke", key=f"rv{t['id']}",
+                                                         help="Pull back to 'Submitted'; the vendor stops seeing it"):
+                    run("UPDATE timesheets SET status='Submitted', decided_by=NULL, decided_at=NULL WHERE id=?", (t["id"],))
+                    flash("Approval revoked - timesheet is pending again")
+                    st.rerun()
+        st.subheader("Recent leave / WFH decisions")
+        done_rq = run(RQ_SQL + " WHERE r.status IN ('Approved','Rejected') ORDER BY r.decided_at DESC LIMIT 30", fetch=True)
+        if done_rq:
+            st.dataframe(pd.DataFrame([{
+                "Employee": r["employee"], "Vendor": r["vendor"],
+                "Type": "WFH" if r["kind"] == "WFH" else f"{r['leave_type']} leave",
+                "From": r["start_date"], "To": r["end_date"], "Days": r["days"],
+                "Status": f"{RQ_BADGE[r['status']]} {r['status']}", "Note": r["manager_note"] or "",
+            } for r in done_rq]), hide_index=True)
+        else:
+            st.caption("Nothing yet.")
+
+
+# ---- vendor view of approved timesheets -----------------------------------
+def page_vendor_timesheets():
+    header("🧾", "Team timesheets", "Approved monthly timesheets for the people you placed")
+    uid = st.session_state.user["id"]
+    emps = run("SELECT id, COALESCE(NULLIF(full_name,''), username) AS name, designation "
+               "FROM users WHERE role='employee' AND vendor_id=? AND approved=1", (uid,), fetch=True)
+    if not emps:
+        st.info("No employees are linked to your company yet. Employees appear here once they sign up "
+                "with you as their vendor (and an admin approves them) or a manager onboards them.")
+        return
+    rows = run(TS_SQL + " WHERE e.vendor_id=? AND t.status='Approved' ORDER BY t.month DESC, employee",
+               (uid,), fetch=True)
+    st.caption("Only timesheets approved by the hiring manager are shared with you.")
+
+    c1, c2 = st.columns(2)
+    months = ["All months"] + sorted({r["month"] for r in rows}, reverse=True)
+    names = ["All employees"] + sorted({e["name"] for e in emps})
+    f_month = c1.selectbox("Month", months, format_func=lambda x: x if x == "All months" else month_label(x))
+    f_emp = c2.selectbox("Employee", names)
+    rows = [r for r in rows if (f_month == "All months" or r["month"] == f_month)
+            and (f_emp == "All employees" or r["employee"] == f_emp)]
+
+    m = st.columns(3)
+    m[0].metric("Employees", len(emps))
+    m[1].metric("Approved timesheets", len(rows))
+    m[2].metric("Approved hours", f"{sum(r['total_hours'] or 0 for r in rows):.1f}")
+    if not rows:
+        st.info("No approved timesheets match the filters yet.")
+        return
+
+    summary, flat = [], []
+    for r in rows:
+        entries = json.loads(r["entries"])
+        s = ts_summary(entries)
+        summary.append({"Employee": r["employee"], "Month": month_label(r["month"]), "Hours": round(s["hours"], 1),
+                        "Office days": s["office"], "WFH days": s["wfh"], "Leave days": s["leave"],
+                        "Approved on": r["decided_at"]})
+        flat += [{"Employee": r["employee"], "Month": r["month"], **e} for e in entries]
+    st.dataframe(pd.DataFrame(summary), hide_index=True)
+    st.download_button("⬇ Download daily detail (CSV)", pd.DataFrame(flat).to_csv(index=False),
+                       file_name="approved_timesheets.csv", mime="text/csv")
+    for r in rows:
+        with st.expander(f"{r['employee']} · {month_label(r['month'])} · {r['total_hours']:.1f} h"):
+            st.dataframe(pd.DataFrame(json.loads(r["entries"])), hide_index=True)
 
 
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 PAGES = {
-    "admin": {"Dashboard": page_dashboard, "Jobs": page_jobs, "Candidate review": page_review, "Users": page_users},
-    "manager": {"Dashboard": page_dashboard, "Jobs": page_jobs, "Candidate review": page_review},
-    "vendor": {"Submit candidates": page_vendor_submit, "My submissions": page_vendor_mine},
+    "admin": [("Dashboard", "📊", page_dashboard), ("Jobs", "📋", page_jobs),
+              ("Candidate review", "🗂️", page_review), ("Approvals", "✅", page_approvals),
+              ("Users", "👥", page_users)],
+    "manager": [("Dashboard", "📊", page_dashboard), ("Jobs", "📋", page_jobs),
+                ("Candidate review", "🗂️", page_review), ("Approvals", "✅", page_approvals)],
+    "vendor": [("Submit candidates", "📤", page_vendor_submit), ("My submissions", "📁", page_vendor_mine),
+               ("Team timesheets", "🧾", page_vendor_timesheets)],
+    "employee": [("My timesheet", "🗓️", page_emp_timesheet), ("Leave & WFH", "🏠", page_emp_requests)],
 }
 
 
@@ -620,10 +1291,16 @@ def main():
         login_view()
         return
     user = st.session_state.user
+    msg = st.session_state.pop("flash", None)
+    if msg:
+        st.toast(msg)
     sidebar_account(user)
-    pages = PAGES[user["role"]]
-    choice = st.sidebar.radio("Navigate", list(pages))
-    pages[choice]()
+    if user["role"] == "admin":
+        n = run("SELECT COUNT(*) AS n FROM users WHERE approved=0", fetch=True)[0]["n"]
+        if n:
+            st.sidebar.info(f"🕓 {n} sign-up(s) awaiting approval")
+    pages = [st.Page(fn, title=title, icon=icon) for title, icon, fn in PAGES[user["role"]]]
+    st.navigation(pages).run()
 
 
 main()
