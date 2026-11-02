@@ -52,6 +52,12 @@ st.markdown("""
 }
 [data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
 button[data-baseweb="tab"] {font-weight: 600;}
+.kpi-icon {font-size: 3rem; text-align: center; padding-top: .8rem; filter: grayscale(1); opacity: .6;}
+.kpi-title {text-align: center; font-size: 1.25rem; letter-spacing: .03em; opacity: .85;}
+.kpi-value {text-align: center; font-size: 2.8rem; font-weight: 600; line-height: 1.15;}
+.kpi-sub {text-align: center; font-size: .8rem; opacity: .6; min-height: 1.2rem;}
+[data-testid="stButton"]:has([data-testid="stBaseButton-tertiary"]) {display: flex; justify-content: flex-end;}
+[data-testid="stBaseButton-tertiary"] {color: var(--primary-color, #4F46E5) !important; font-weight: 600;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -74,7 +80,9 @@ CREATE TABLE IF NOT EXISTS users(
   pw_hash TEXT NOT NULL, salt TEXT NOT NULL,
   active INTEGER DEFAULT 1, created_at TEXT,
   vendor_id INTEGER, candidate_id INTEGER, designation TEXT,
-  approved INTEGER DEFAULT 1       -- self sign-ups start at 0 until an admin approves
+  approved INTEGER DEFAULT 1,      -- self sign-ups start at 0 until an admin approves
+  join_date TEXT, resigned_on TEXT, exit_date TEXT, exit_reason TEXT,
+  department TEXT, fte REAL DEFAULT 1.0
 );
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +98,7 @@ CREATE TABLE IF NOT EXISTS candidates(
   resume_name TEXT, resume_blob BLOB, resume_text TEXT,
   status TEXT DEFAULT 'Submitted', decision_reason TEXT,
   decided_by INTEGER, decided_at TEXT,
-  ai_score REAL, ai_details TEXT, created_at TEXT,
+  ai_score REAL, ai_details TEXT, created_at TEXT, offered_at TEXT,
   UNIQUE(job_id, email)
 );
 CREATE TABLE IF NOT EXISTS timesheets(
@@ -142,13 +150,15 @@ def verify_pw(password, pw_hash, salt):
 
 
 def create_user(username, password, role, full_name="", company="",
-                vendor_id=None, candidate_id=None, designation="", approved=1):
-    h, s = hash_pw(password)
+                vendor_id=None, candidate_id=None, designation="", approved=1,
+                department="", fte=1.0):
+    h, s_ = hash_pw(password)
     return run(
         """INSERT INTO users(username,full_name,company,role,pw_hash,salt,created_at,
-           vendor_id,candidate_id,designation,approved) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (username.strip(), full_name.strip(), company.strip(), role, h, s, now(),
-         vendor_id, candidate_id, designation, approved),
+           vendor_id,candidate_id,designation,approved,join_date,department,fte)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (username.strip(), full_name.strip(), company.strip(), role, h, s_, now(),
+         vendor_id, candidate_id, designation, approved, date.today().isoformat(), department, fte),
     )
 
 
@@ -168,11 +178,28 @@ def migrate_users(conn):
         conn.commit()
 
 
+NEW_COLUMNS = {
+    "users": {"join_date": "TEXT", "resigned_on": "TEXT", "exit_date": "TEXT",
+              "exit_reason": "TEXT", "department": "TEXT", "fte": "REAL DEFAULT 1.0"},
+    "candidates": {"offered_at": "TEXT"},
+}
+
+
+def ensure_columns(conn):
+    for table, cols in NEW_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in cols.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    conn.commit()
+
+
 @st.cache_resource
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     migrate_users(conn)
+    ensure_columns(conn)
     conn.commit()
     conn.close()
     if not run("SELECT id FROM users LIMIT 1", fetch=True):
@@ -181,7 +208,7 @@ def init_db():
 
 
 CAND_COLS = """c.id, c.job_id, c.vendor_id, c.name, c.email, c.phone, c.resume_name,
-  c.status, c.decision_reason, c.decided_at, c.ai_score, c.ai_details, c.created_at,
+  c.status, c.decision_reason, c.decided_at, c.offered_at, c.ai_score, c.ai_details, c.created_at,
   j.title AS job_title,
   COALESCE(NULLIF(u.company,''), NULLIF(u.full_name,''), u.username) AS vendor"""
 
@@ -384,6 +411,8 @@ def signin_form():
             if rows and verify_pw(p, rows[0]["pw_hash"], rows[0]["salt"]):
                 if not rows[0]["approved"]:
                     st.warning("Your account is waiting for admin approval. Please check back later.")
+                elif rows[0].get("exit_date") and rows[0]["exit_date"] < date.today().isoformat():
+                    st.error("Your employment has ended and this account is now closed.")
                 else:
                     st.session_state.user = rows[0]
                     st.rerun()
@@ -540,6 +569,8 @@ def page_jobs():
 def decide(cid, status, reason="", name="Candidate"):
     run("UPDATE candidates SET status=?, decision_reason=?, decided_by=?, decided_at=? WHERE id=?",
         (status, reason, st.session_state.user["id"], now(), cid))
+    if status != "Accepted":
+        run("UPDATE candidates SET offered_at=NULL WHERE id=?", (cid,))
     flash(f"{BADGE[status]} {name} moved to {status}")
     st.rerun()
 
@@ -589,9 +620,17 @@ def candidate_card(c, rank):
         if c["status"] == "Accepted":
             emp = run("SELECT username FROM users WHERE candidate_id=?", (c["id"],), fetch=True)
             if emp:
-                st.caption(f"✅ Employee login: `{emp[0]['username']}`")
-            elif st.button("🪪 Onboard as employee", key=f"ob{c['id']}"):
-                onboard_dialog(c)
+                st.caption(f"✅ Joined - employee login: `{emp[0]['username']}`")
+            else:
+                o1, o2, _ = st.columns([1.5, 1.7, 3])
+                if c["offered_at"]:
+                    o1.caption(f"📝 Offer released {c['offered_at'][:10]}")
+                elif o1.button("📝 Offer released", key=f"of{c['id']}"):
+                    run("UPDATE candidates SET offered_at=? WHERE id=?", (now(), c["id"]))
+                    flash(f"📝 Offer marked as released for {c['name']}")
+                    st.rerun()
+                if o2.button("🪪 Onboard as employee", key=f"ob{c['id']}"):
+                    onboard_dialog(c)
 
 
 def page_review():
@@ -754,7 +793,7 @@ def page_users():
                 a.markdown(f"**{u['full_name']}** (`{u['username']}`) · requested role: **{u['role']}**  \n"
                            f"{detail} · signed up {u['created_at']}")
                 if b.button("Approve", key=f"ap{u['id']}", type="primary"):
-                    run("UPDATE users SET approved=1 WHERE id=?", (u["id"],))
+                    run("UPDATE users SET approved=1, join_date=? WHERE id=?", (date.today().isoformat(), u["id"]))
                     flash(f"✅ {u['username']} approved as {u['role']}")
                     st.rerun()
                 if c.button("Reject", key=f"rjs{u['id']}"):
@@ -995,8 +1034,10 @@ def onboard_dialog(c):
             st.error("Username and a password of 8+ characters are required.")
         else:
             try:
+                job = run("SELECT department, employment_type FROM jobs WHERE id=?", (c["job_id"],), fetch=True)[0]
                 create_user(username, pw, "employee", c["name"], c["vendor"], vendor_id=c["vendor_id"],
-                            candidate_id=c["id"], designation=c["job_title"])
+                            candidate_id=c["id"], designation=c["job_title"],
+                            department=job["department"] or "", fte=fte_for(job["employment_type"]))
                 flash(f"🪪 Employee login created for {c['name']}")
                 st.rerun()
             except sqlite3.IntegrityError:
@@ -1271,14 +1312,280 @@ def page_vendor_timesheets():
 
 
 # --------------------------------------------------------------------------
+# Hiring statistics dashboard + employee lifecycle (join / resign / exit)
+# --------------------------------------------------------------------------
+def fte_for(employment_type):
+    """Full-time equivalent used for FTE view when a job / employee has no explicit value."""
+    return 0.5 if employment_type in ("Part-time", "Internship") else 1.0
+
+
+def link_button(label, key):
+    try:  # 'tertiary' (link-style) buttons need a recent Streamlit; fall back gracefully
+        return st.button(label, key=key, type="tertiary")
+    except Exception:
+        return st.button(label, key=key)
+
+
+@st.dialog("Details", width="large")
+def details_dialog(title, df, note=""):
+    st.subheader(title)
+    if note:
+        st.caption(note)
+    if df.empty:
+        st.info("Nothing to show for the selected filters.")
+        return
+    st.dataframe(df, hide_index=True)
+    st.download_button("⬇ Download CSV", df.to_csv(index=False),
+                       file_name=title.lower().replace(" ", "_") + ".csv", mime="text/csv")
+
+
+def hiring_stats(year, dept, fte_view):
+    """Build the six KPI cards. Returns (cards, active_employees_df)."""
+    today = date.today().isoformat()
+    ref = today if year == "All" else min(today, f"{year}-12-31")   # headcount is 'as of' this date
+
+    def in_year(series):
+        return pd.Series(True, index=series.index) if year == "All" else series.fillna("").str[:4] == str(year)
+
+    # ---- employees ---------------------------------------------------------
+    ecols = ["id", "name", "designation", "department", "fte", "join_date", "resigned_on",
+             "exit_date", "exit_reason", "vendor"]
+    emps = pd.DataFrame(run("""
+        SELECT u.id, COALESCE(NULLIF(u.full_name,''), u.username) AS name, u.designation,
+               COALESCE(NULLIF(u.department,''),'Unassigned') AS department, COALESCE(u.fte,1.0) AS fte,
+               u.join_date, u.resigned_on, u.exit_date, u.exit_reason,
+               COALESCE(NULLIF(v.company,''), NULLIF(v.full_name,''), v.username, '-') AS vendor
+        FROM users u LEFT JOIN users v ON v.id=u.vendor_id
+        WHERE u.role='employee' AND u.approved=1""", fetch=True), columns=ecols)
+    for c in ("join_date", "resigned_on", "exit_date", "exit_reason"):
+        emps[c] = emps[c].fillna("")
+    emps["w"] = emps["fte"].astype(float) if fte_view else 1.0
+    if dept != "All":
+        emps = emps[emps.department == dept]
+
+    active = emps[(emps.join_date <= ref) & ((emps.exit_date == "") | (emps.exit_date > ref))].copy()
+    active["status"] = ["Serving notice" if (ro and ed > today) else "Active"
+                        for ro, ed in zip(active.resigned_on, active.exit_date)]
+    notice = emps[(emps.resigned_on != "") & (emps.exit_date > today) & in_year(emps.resigned_on)]
+    left = emps[(emps.exit_date != "") & (emps.exit_date <= today) & in_year(emps.exit_date)]
+
+    # ---- candidates (selected / offered) -----------------------------------
+    ccols = ["id", "name", "status", "decided_at", "offered_at", "ai_score", "job_title",
+             "department", "employment_type", "vendor", "joined"]
+    cands = pd.DataFrame(run("""
+        SELECT c.id, c.name, c.status, c.decided_at, c.offered_at, c.ai_score, j.title AS job_title,
+               COALESCE(NULLIF(j.department,''),'Unassigned') AS department, j.employment_type,
+               COALESCE(NULLIF(u.company,''), NULLIF(u.full_name,''), u.username) AS vendor,
+               (SELECT COUNT(*) FROM users e WHERE e.candidate_id=c.id) AS joined
+        FROM candidates c JOIN jobs j ON j.id=c.job_id JOIN users u ON u.id=c.vendor_id""", fetch=True), columns=ccols)
+    cands["decided_at"] = cands.decided_at.fillna("")
+    cands["offered_at"] = cands.offered_at.fillna("")
+    cands["w"] = cands.employment_type.map(fte_for) if fte_view else 1.0
+    if dept != "All":
+        cands = cands[cands.department == dept]
+    pool = cands[(cands.status == "Accepted") & (cands.joined == 0)]
+    selected = pool[(pool.offered_at == "") & in_year(pool.decided_at)]
+    offered = pool[(pool.offered_at != "") & in_year(pool.offered_at)]
+    submitted = float(cands.w.sum())
+
+    # ---- open positions (always the current picture) -----------------------
+    jcols = ["id", "title", "department", "employment_type", "openings", "filled"]
+    jobs = pd.DataFrame(run("""
+        SELECT j.id, j.title, COALESCE(NULLIF(j.department,''),'Unassigned') AS department,
+               j.employment_type, j.openings,
+               (SELECT COUNT(*) FROM candidates c WHERE c.job_id=j.id AND c.status='Accepted') AS filled
+        FROM jobs j WHERE j.status='Open'""", fetch=True), columns=jcols)
+    if dept != "All":
+        jobs = jobs[jobs.department == dept]
+    jobs["open_n"] = (jobs.openings.astype(float) - jobs.filled.astype(float)).clip(lower=0)
+    jobs = jobs[jobs.open_n > 0].copy()
+    jobs["w"] = jobs.employment_type.map(fte_for) if fte_view else 1.0
+
+    # ---- numbers -------------------------------------------------------------
+    hc = float(active.w.sum())
+    op = float((jobs.open_n * jobs.w).sum())
+    rs = float(notice.w.sum())
+    at = float(left.w.sum())
+    sl = float(selected.w.sum())
+    of = float(offered.w.sum())
+    pct = lambda a, b: (a / b * 100) if b else 0.0
+
+    d_hc = active[["name", "vendor", "department", "designation", "fte", "join_date", "status"]].rename(columns={
+        "name": "Employee", "vendor": "Vendor", "department": "Department", "designation": "Title",
+        "fte": "FTE", "join_date": "Joined", "status": "Status"})
+    d_op = jobs[["title", "department", "employment_type", "openings", "filled", "open_n"]].rename(columns={
+        "title": "Job", "department": "Department", "employment_type": "Type", "openings": "Openings",
+        "filled": "Filled (accepted)", "open_n": "Still open"})
+    d_op["Still open"] = d_op["Still open"].astype(int)
+    d_rs = notice[["name", "vendor", "department", "resigned_on", "exit_date", "exit_reason"]].rename(columns={
+        "name": "Employee", "vendor": "Vendor", "department": "Department", "resigned_on": "Resigned on",
+        "exit_date": "Last working day", "exit_reason": "Reason"})
+    d_at = left[["name", "vendor", "department", "join_date", "exit_date", "exit_reason"]].rename(columns={
+        "name": "Employee", "vendor": "Vendor", "department": "Department", "join_date": "Joined",
+        "exit_date": "Left on", "exit_reason": "Reason"})
+    d_sl = selected[["name", "job_title", "department", "vendor", "decided_at", "ai_score"]].rename(columns={
+        "name": "Candidate", "job_title": "Job", "department": "Department", "vendor": "Vendor",
+        "decided_at": "Selected on", "ai_score": "AI score"})
+    d_of = offered[["name", "job_title", "department", "vendor", "offered_at", "ai_score"]].rename(columns={
+        "name": "Candidate", "job_title": "Job", "department": "Department", "vendor": "Vendor",
+        "offered_at": "Offer released", "ai_score": "AI score"})
+
+    cards = [
+        dict(key="hc", title="Headcount", icon="🧑‍💼", value=hc, pct=pct(hc, hc + op),
+             basis="of approved positions filled", detail=d_hc,
+             note=f"Employees on the team as of {ref}, including anyone serving notice."),
+        dict(key="op", title="Open Positions", icon="💼", value=op, pct=pct(op, hc + op),
+             basis="of approved positions still open", detail=d_op,
+             note="Openings on open jobs minus candidates already accepted. Always the current picture."),
+        dict(key="rs", title="Resigned", icon="🚪", value=rs, pct=pct(rs, hc),
+             basis="of headcount serving notice", detail=d_rs,
+             note="Resignation recorded, last working day still ahead."),
+        dict(key="at", title="Attrition", icon="🏃", value=at, pct=pct(at, hc + at),
+             basis="of everyone who worked here", detail=d_at,
+             note="Employees whose last working day has passed."),
+        dict(key="sl", title="Selected", icon="🙋", value=sl, pct=pct(sl, submitted),
+             basis="of candidates submitted", detail=d_sl,
+             note="Accepted by the manager, offer not released yet."),
+        dict(key="of", title="Offered", icon="📝", value=of, pct=pct(of, submitted),
+             basis="of candidates submitted", detail=d_of,
+             note="Offer released, candidate has not joined yet."),
+    ]
+    return cards, active
+
+
+def page_hiring_stats():
+    header("📈", "Hiring statistics", "Headcount, open positions, attrition and the offer pipeline")
+
+    years = {date.today().year}
+    for r in run("""SELECT substr(join_date,1,4) AS y FROM users WHERE join_date IS NOT NULL
+                    UNION SELECT substr(exit_date,1,4) FROM users WHERE exit_date IS NOT NULL
+                    UNION SELECT substr(created_at,1,4) FROM candidates
+                    UNION SELECT substr(offered_at,1,4) FROM candidates WHERE offered_at IS NOT NULL""", fetch=True):
+        try:
+            years.add(int(r["y"]))
+        except (TypeError, ValueError):
+            pass
+    depts = sorted({r["d"] for r in run(
+        """SELECT COALESCE(NULLIF(department,''),'Unassigned') AS d FROM jobs
+           UNION SELECT COALESCE(NULLIF(department,''),'Unassigned') FROM users WHERE role='employee'""", fetch=True)})
+
+    f1, f2, f3, f4 = st.columns([2, 2, 1.4, 1.6])
+    year = f1.selectbox("Year", ["All"] + [str(y) for y in sorted(years, reverse=True)])
+    dept = f2.selectbox("Department / COE", ["All"] + depts)
+    fte_view = f3.toggle("FTE view", help="Off = head count (people). On = full-time equivalents, "
+                                         "where a part-timer or intern counts as 0.5.")
+    pct_view = f4.toggle("Show percentages", help="Each card shows its share of a sensible base - "
+                                                 "the base is printed under the number.")
+
+    cards, active = hiring_stats(year, dept, fte_view)
+    for row in (cards[:3], cards[3:]):
+        cols = st.columns(3)
+        for col, k in zip(cols, row):
+            with col, st.container(border=True):
+                ic, tx = st.columns([1, 2])
+                ic.markdown(f"<div class='kpi-icon'>{k['icon']}</div>", unsafe_allow_html=True)
+                if pct_view:
+                    val, sub = f"{k['pct']:.1f}%", k["basis"]
+                else:
+                    val, sub = (f"{k['value']:.1f}" if fte_view else f"{int(round(k['value']))}"), "FTE" if fte_view else "people"
+                tx.markdown(f"<div class='kpi-title'>{k['title']}</div><div class='kpi-value'>{val}</div>"
+                            f"<div class='kpi-sub'>{sub}</div>", unsafe_allow_html=True)
+                if link_button("More Details ›", key=f"md_{k['key']}"):
+                    details_dialog(k["title"], k["detail"], k["note"])
+
+    st.caption(f"Headcount is as of {'today' if year == 'All' else 'the end of ' + year}. "
+               "Open positions are always current. Resigned = notice period running; Attrition = already left.")
+
+    if not active.empty:
+        c1, c2 = st.columns(2)
+        unit = "FTE" if fte_view else "Headcount"
+        by_dept = active.groupby("department", as_index=False).w.sum()
+        fig = px.bar(by_dept, x="w", y="department", orientation="h", labels={"w": unit, "department": ""},
+                     title=f"{unit} by department", color_discrete_sequence=["#4F46E5"])
+        c1.plotly_chart(style_fig(fig, 320))
+        by_v = active.groupby("vendor", as_index=False).w.sum()
+        fig = px.bar(by_v, x="w", y="vendor", orientation="h", labels={"w": unit, "vendor": ""},
+                     title=f"{unit} by vendor", color_discrete_sequence=["#10B981"])
+        c2.plotly_chart(style_fig(fig, 320))
+
+
+# ---- employees page (manager / admin) ------------------------------------
+def page_employees():
+    header("🧑‍💻", "Employees", "Department, FTE, joining date and resignations")
+    emps = run("""SELECT u.*, COALESCE(NULLIF(v.company,''), NULLIF(v.full_name,''), v.username, '-') AS vendor_name
+                  FROM users u LEFT JOIN users v ON v.id=u.vendor_id
+                  WHERE u.role='employee' AND u.approved=1 ORDER BY u.id""", fetch=True)
+    if not emps:
+        st.info("No employees yet. Onboard an accepted candidate from Candidate review, "
+                "or approve an employee sign-up in Users.")
+        return
+    today = date.today().isoformat()
+
+    def state(e):
+        if e["exit_date"] and e["exit_date"] <= today:
+            return "⚪ Left"
+        return "🟠 Serving notice" if e["resigned_on"] else "🟢 Active"
+
+    st.dataframe(pd.DataFrame([{
+        "Employee": e["full_name"] or e["username"], "Vendor": e["vendor_name"], "Title": e["designation"],
+        "Department": e["department"] or "Unassigned", "FTE": e["fte"], "Joined": e["join_date"],
+        "Status": state(e), "Last working day": e["exit_date"],
+    } for e in emps]), hide_index=True)
+
+    lookup = {e["id"]: e for e in emps}
+    eid = st.selectbox("Select employee", list(lookup),
+                       format_func=lambda i: f"{lookup[i]['full_name'] or lookup[i]['username']} ({lookup[i]['vendor_name']})")
+    e = lookup[eid]
+
+    with st.container(border=True):
+        st.markdown("#### Details")
+        c1, c2, c3 = st.columns(3)
+        dept = c1.text_input("Department / COE", value=e["department"] or "", key=f"dp{eid}")
+        fte = c2.number_input("FTE", 0.1, 1.0, float(e["fte"] or 1.0), 0.1, key=f"ft{eid}")
+        jd = c3.date_input("Join date", value=date.fromisoformat(e["join_date"]) if e["join_date"] else date.today(),
+                           key=f"jd{eid}")
+        if st.button("Save details", key=f"sd{eid}"):
+            run("UPDATE users SET department=?, fte=?, join_date=? WHERE id=?", (dept.strip(), fte, jd.isoformat(), eid))
+            flash("Employee details saved")
+            st.rerun()
+
+    with st.container(border=True):
+        st.markdown("#### Resignation / exit")
+        if e["resigned_on"]:
+            st.info(f"Resigned on {e['resigned_on']} · last working day {e['exit_date']}"
+                    + (f" · {e['exit_reason']}" if e["exit_reason"] else ""))
+        r1, r2 = st.columns(2)
+        resigned = r1.date_input("Resignation date", value=date.fromisoformat(e["resigned_on"]) if e["resigned_on"] else date.today(),
+                                 key=f"rd{eid}")
+        last_day = r2.date_input("Last working day", value=date.fromisoformat(e["exit_date"]) if e["exit_date"] else date.today() + timedelta(days=30),
+                                 key=f"ld{eid}")
+        reason = st.text_input("Reason (optional)", value=e["exit_reason"] or "", key=f"rr{eid}")
+        b1, b2, _ = st.columns([1.4, 1.4, 3])
+        if b1.button("Record resignation", type="primary", key=f"rr_b{eid}"):
+            if last_day < resigned:
+                st.error("The last working day can't be before the resignation date.")
+            else:
+                run("UPDATE users SET resigned_on=?, exit_date=?, exit_reason=? WHERE id=?",
+                    (resigned.isoformat(), last_day.isoformat(), reason.strip(), eid))
+                flash("Resignation recorded - their login stops working after the last working day")
+                st.rerun()
+        if e["resigned_on"] and b2.button("Withdraw resignation", key=f"wd{eid}"):
+            run("UPDATE users SET resigned_on=NULL, exit_date=NULL, exit_reason=NULL WHERE id=?", (eid,))
+            flash("Resignation withdrawn")
+            st.rerun()
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 PAGES = {
-    "admin": [("Dashboard", "📊", page_dashboard), ("Jobs", "📋", page_jobs),
-              ("Candidate review", "🗂️", page_review), ("Approvals", "✅", page_approvals),
+    "admin": [("Hiring stats", "📈", page_hiring_stats), ("Vendor performance", "📊", page_dashboard),
+              ("Jobs", "📋", page_jobs), ("Candidate review", "🗂️", page_review),
+              ("Approvals", "✅", page_approvals), ("Employees", "🧑‍💻", page_employees),
               ("Users", "👥", page_users)],
-    "manager": [("Dashboard", "📊", page_dashboard), ("Jobs", "📋", page_jobs),
-                ("Candidate review", "🗂️", page_review), ("Approvals", "✅", page_approvals)],
+    "manager": [("Hiring stats", "📈", page_hiring_stats), ("Vendor performance", "📊", page_dashboard),
+                ("Jobs", "📋", page_jobs), ("Candidate review", "🗂️", page_review),
+                ("Approvals", "✅", page_approvals), ("Employees", "🧑‍💻", page_employees)],
     "vendor": [("Submit candidates", "📤", page_vendor_submit), ("My submissions", "📁", page_vendor_mine),
                ("Team timesheets", "🧾", page_vendor_timesheets)],
     "employee": [("My timesheet", "🗓️", page_emp_timesheet), ("Leave & WFH", "🏠", page_emp_requests)],
