@@ -2203,13 +2203,256 @@ def page_dashboard():
         st.line_chart(df.groupby("day").size())
 
 
+# ---- bulk import of vendors / hiring managers (admin) -------------------------
+USER_ALIASES = {
+    "name": "full_name", "contact": "full_name", "contact_name": "full_name", "contact_person": "full_name",
+    "manager": "full_name", "manager_name": "full_name",
+    "vendor": "company", "vendor_name": "company", "company_name": "company", "supplier": "company",
+}
+
+
+def read_sheet(f):
+    """Read an uploaded CSV / Excel file as text. Returns (DataFrame, error message or None)."""
+    try:
+        if f.name.lower().endswith(".csv"):
+            try:
+                raw = pd.read_csv(f, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                f.seek(0)
+                raw = pd.read_csv(f, dtype=str, keep_default_na=False, encoding="latin-1")
+        else:
+            raw = pd.read_excel(f, dtype=str)
+    except Exception as e:
+        return None, f"Could not read the file: {e}"
+    if len(raw) > 2000:
+        return None, "Please import at most 2,000 rows at a time."
+    return raw, None
+
+
+def user_import_template(role):
+    if role == "vendor":
+        rows = [{"company": "Acme Staffing", "full_name": "Priya Shah", "username": ""},
+                {"company": "Globex Corp", "full_name": "Sam Lee", "username": "globex.sam"}]
+    else:
+        rows = [{"full_name": "Neha Kapoor", "company": "Hash Promotes", "username": ""},
+                {"full_name": "Arjun Rao", "company": "", "username": "arjun.rao"}]
+    return pd.DataFrame(rows).to_csv(index=False)
+
+
+def validate_users_import(raw, role):
+    """Check every row of a vendor / manager sheet. Returns (rows, fatal_error)."""
+    df = raw.copy()
+    df.columns = [USER_ALIASES.get(k, k) for k in
+                  (re.sub(r"[\s\-]+", "_", str(c).strip().lower()) for c in df.columns)]
+    df = df.loc[:, ~df.columns.duplicated()]
+    required = "company" if role == "vendor" else "full_name"
+    if required not in df.columns:
+        return [], f"Missing required column: {required}"
+    for c in ("full_name", "company", "username"):
+        if c not in df.columns:
+            df[c] = ""
+    df = df.fillna("").astype(str)
+
+    def key(full, company):
+        return (company or full).strip().lower() if role == "vendor" else (full.strip().lower(), company.strip().lower())
+
+    used = {r["username"].lower() for r in run("SELECT username FROM users", fetch=True)}
+    existing = {key(r["full_name"] or "", r["company"] or "")
+                for r in run("SELECT full_name, company FROM users WHERE role=?", (role,), fetch=True)}
+    rows = []
+    for i, r in df.iterrows():
+        if not any(str(x).strip() for x in r.values):
+            continue
+        errs = []
+        full, company, explicit = r["full_name"].strip(), r["company"].strip(), r["username"].strip()
+        if role == "vendor":
+            if not company:
+                errs.append("company is required")
+        elif not full:
+            errs.append("full_name is required")
+        if not errs and key(full, company) in existing:
+            errs.append("already exists (vendor with that company name)" if role == "vendor"
+                        else "already exists (same name and company)")
+        uname = ""
+        if explicit:
+            if not USERNAME_RE.match(explicit):
+                errs.append("invalid username")
+            elif explicit.lower() in used:
+                errs.append("username already taken")
+            else:
+                uname = explicit
+        else:
+            src = company if role == "vendor" else full
+            base = re.sub(r"[^a-z0-9._-]", "", src.lower().replace(" ", "."))[:28] or "user"
+            base = base if len(base) >= 3 else base + "usr"
+            uname, n = base, 2
+            while uname.lower() in used:
+                uname, n = f"{base}{n}", n + 1
+        if not errs:
+            used.add(uname.lower())
+            existing.add(key(full, company))
+        rows.append({"row": i + 2, "full_name": full or company, "company": company, "username": uname,
+                     "error": "; ".join(errs)})
+    return rows, None
+
+
+def run_users_import(rows, role):
+    creds, failed = [], []
+    for r in rows:
+        pw = secrets.token_urlsafe(9)
+        try:
+            create_user(r["username"], pw, role, r["full_name"], r["company"])
+        except sqlite3.IntegrityError:
+            failed.append(f"Row {r['row']}: username '{r['username']}' was taken meanwhile")
+            continue
+        entry = {"full_name": csv_safe(r["full_name"])}
+        if role == "vendor":
+            entry["company"] = csv_safe(r["company"])
+        entry.update({"username": r["username"], "temporary_password": pw})
+        creds.append(entry)
+    return {"creds": pd.DataFrame(creds), "failed": failed}
+
+
+def bulk_users_tab(role):
+    label = "vendors" if role == "vendor" else "hiring managers"
+    rk, nk = f"bulkU_result_{role}", f"bulkU_n_{role}"
+
+    if rk in st.session_state:  # result screen, shown once after an import
+        res = st.session_state[rk]
+        st.success(f"Imported {len(res['creds'])} {label}.")
+        for msg in res["failed"]:
+            st.warning(msg)
+        if not res["creds"].empty:
+            st.warning("These temporary passwords are shown **only now** and are not stored in readable form. "
+                       "Download the list and share each login securely; people can change their password "
+                       "from the sidebar after signing in.")
+            st.dataframe(res["creds"], hide_index=True)
+            st.download_button("⬇ Download logins (CSV)", res["creds"].to_csv(index=False),
+                               file_name=f"{role}_logins.csv", mime="text/csv", key=f"dl_{rk}")
+        if st.button("Import another file", key=f"again_{role}"):
+            del st.session_state[rk]
+            st.session_state[nk] = st.session_state.get(nk, 0) + 1
+            st.rerun()
+        return
+
+    if role == "vendor":
+        st.markdown("Upload a **CSV or Excel** file with one row per vendor company. Required column: `company`. "
+                    "Optional: `full_name` (contact person) and `username`.")
+    else:
+        st.markdown("Upload a **CSV or Excel** file with one row per hiring manager. Required column: `full_name`. "
+                    "Optional: `company` (company or department) and `username`.")
+    st.caption("Imported accounts are approved immediately and get a random temporary password. "
+               "Headers like `name`, `vendor` or `company_name` are recognised too.")
+    st.download_button("⬇ Download template", user_import_template(role),
+                       file_name=f"{role}_import_template.csv", mime="text/csv", key=f"tpl_{role}")
+    f = st.file_uploader("CSV or Excel file", type=["csv", "xlsx"], key=f"bulkU_file_{role}_{st.session_state.get(nk, 0)}")
+    if f is None:
+        return
+    raw, err = read_sheet(f)
+    if err:
+        st.error(err)
+        return
+    rows, fatal = validate_users_import(raw, role)
+    if fatal:
+        st.error(fatal)
+        return
+    if not rows:
+        st.info("The file has no data rows.")
+        return
+    ready = [r for r in rows if not r["error"]]
+    m = st.columns(3)
+    m[0].metric("Rows in file", len(rows))
+    m[1].metric("Ready to import", len(ready))
+    m[2].metric("With errors", len(rows) - len(ready))
+    st.dataframe(pd.DataFrame([{
+        "Row": r["row"], "Company": r["company"], "Name": r["full_name"], "Username": r["username"],
+        "Status": ("❌ " + r["error"]) if r["error"] else "✅ Ready",
+    } for r in rows]), hide_index=True)
+    if len(ready) < len(rows):
+        st.caption("Rows with errors are skipped. Fix them in your file and upload again, "
+                   "or import the ready rows now and add the rest later.")
+    if ready and st.button(f"Import {len(ready)} {label}", type="primary", key=f"go_{role}"):
+        st.session_state[rk] = run_users_import(ready, role)
+        st.rerun()
+
+
+# ---- admin: edit a user ----------------------------------------------------------
+def edit_user_panel(u, all_vendors):
+    me = st.session_state.user["id"]
+    uid = u["id"]
+    vend_opts = dict(vendor_options())
+    cur_v = u["vendor_id"]
+    if cur_v and cur_v not in vend_opts and cur_v in all_vendors:
+        vend_opts[cur_v] = all_vendors[cur_v] + " (inactive)"
+    roles = ["admin", "manager", "vendor", "employee"]
+
+    with st.container(border=True):
+        st.markdown("#### ✏️ Edit details")
+        with st.form(f"edit_user_{uid}"):
+            c1, c2 = st.columns(2)
+            full = c1.text_input("Full name", value=u["full_name"] or "", key=f"eu_full_{uid}")
+            username = c2.text_input("Username", value=u["username"], key=f"eu_user_{uid}")
+            role = c1.selectbox("Role", roles, index=roles.index(u["role"]), key=f"eu_role_{uid}",
+                                disabled=(uid == me), help="You can't change your own role.")
+            company = c2.text_input("Company", value=u["company"] or "", key=f"eu_co_{uid}",
+                                    help="Vendors: the company name shown on dashboards. Managers: optional.")
+            vendor_id = c1.selectbox("Supplying vendor (employees)", list(vend_opts), key=f"eu_vend_{uid}",
+                                     index=list(vend_opts).index(cur_v) if cur_v in vend_opts else None,
+                                     format_func=lambda i: vend_opts[i], placeholder="Select vendor")
+            designation = c2.text_input("Job title (employees)", value=u["designation"] or "", key=f"eu_des_{uid}")
+            if st.form_submit_button("Save changes", type="primary"):
+                uname, err = username.strip(), None
+                if not full.strip():
+                    err = "Full name is required."
+                elif uname != u["username"] and not USERNAME_RE.match(uname):   # only check format when it's being changed
+                    err = "Username must be 3-32 characters: letters, numbers, . _ -"
+                elif not uname:
+                    err = "Username is required."
+                elif run("SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?", (uname, uid), fetch=True):
+                    err = "That username is already taken."
+                elif role == "vendor" and not company.strip():
+                    err = "Vendors need a company name."
+                elif role == "employee" and vendor_id is None:
+                    err = "Employees must be linked to a supplying vendor."
+                elif role != u["role"]:
+                    if u["role"] == "admin" and run(
+                            "SELECT COUNT(*) AS n FROM users WHERE role='admin' AND active=1 AND approved=1 AND id<>?",
+                            (uid,), fetch=True)[0]["n"] == 0:
+                        err = "This is the last active admin - make someone else an admin first."
+                    elif u["role"] == "vendor":
+                        nc = run("SELECT COUNT(*) AS n FROM candidates WHERE vendor_id=?", (uid,), fetch=True)[0]["n"]
+                        ne = run("SELECT COUNT(*) AS n FROM users WHERE role='employee' AND vendor_id=?", (uid,), fetch=True)[0]["n"]
+                        if nc or ne:
+                            err = (f"This vendor still has {nc} candidate(s) and {ne} employee(s) linked to it, so its role "
+                                   "can't change. Move the employees to another vendor, or deactivate the account instead.")
+                if err:
+                    st.error(err)
+                else:
+                    if role == "employee":
+                        vname = vend_opts[vendor_id].replace(" (inactive)", "")
+                        run("""UPDATE users SET full_name=?, username=?, role=?, company=?, vendor_id=?, designation=?,
+                               join_date=COALESCE(NULLIF(join_date,''), ?) WHERE id=?""",
+                            (full.strip(), uname, role, vname, vendor_id, designation.strip(), date.today().isoformat(), uid))
+                    else:
+                        run("UPDATE users SET full_name=?, username=?, role=?, company=?, vendor_id=NULL, designation='' WHERE id=?",
+                            (full.strip(), uname, role, company.strip(), uid))
+                    if role == "vendor":  # keep the company name on this vendor's employees in step
+                        run("UPDATE users SET company=? WHERE role='employee' AND vendor_id=?", (company.strip(), uid))
+                    flash(f"✏️ Saved changes for {uname}")
+                    st.rerun()
+        st.caption("Role and name changes apply to that person right away. If you change a username, tell them - "
+                   "they must sign in with the new one.")
+
+
+# ---- Users page -------------------------------------------------------------------
 def page_users():
-    header("👥", "User management", "Approve sign-ups and manage logins")
+    header("👥", "User management", "Approve sign-ups, edit accounts and import people in bulk")
     pending = run("SELECT * FROM users WHERE approved=0 ORDER BY created_at", fetch=True)
     all_vendors = {r["id"]: r["name"] for r in run(
         """SELECT id, COALESCE(NULLIF(company,''), NULLIF(full_name,''), username) AS name
            FROM users WHERE role='vendor'""", fetch=True)}
-    tab_list, tab_pending, tab_new = st.tabs(["Users", f"🕓 Pending sign-ups ({len(pending)})", "➕ Add user"])
+    tab_list, tab_pending, tab_new, tab_bulk = st.tabs(
+        ["Users", f"🕓 Pending sign-ups ({len(pending)})", "➕ Add user", "⬆ Bulk import"])
 
     with tab_pending:
         if not pending:
@@ -2262,30 +2505,52 @@ def page_users():
                     except sqlite3.IntegrityError:
                         st.error("That username already exists.")
 
+    with tab_bulk:
+        what = st.radio("What are you importing?", ["Vendors", "Hiring managers", "Employees"], horizontal=True,
+                        help="Import vendors first - employees must be linked to an existing vendor.")
+        if what == "Vendors":
+            bulk_users_tab("vendor")
+        elif what == "Hiring managers":
+            bulk_users_tab("manager")
+        else:
+            bulk_import_tab()
+
     with tab_list:
+        f1, f2 = st.columns([3, 1])
+        q = f1.text_input("Search", placeholder="Name, username or company", key="user_search").strip().lower()
+        rf = f2.selectbox("Role", ["All", "admin", "manager", "vendor", "employee"], key="user_role_filter")
         users = run("""SELECT id,username,full_name,company,role,active,approved,vendor_id,designation,created_at
                        FROM users ORDER BY id""", fetch=True)
-        df = pd.DataFrame(users)
-        df["vendor"] = df.vendor_id.map(lambda v: all_vendors.get(v, "") if pd.notna(v) else "")
-        st.dataframe(df.drop(columns=["vendor_id"]), hide_index=True)
-        lookup = {u["id"]: u for u in users}
-        with st.container(border=True):
-            uid = st.selectbox("Manage user", list(lookup),
-                               format_func=lambda i: f"{lookup[i]['username']} ({lookup[i]['role']})")
-            c1, c2 = st.columns(2)
-            if uid != st.session_state.user["id"]:
-                label = "Deactivate" if lookup[uid]["active"] else "Activate"
-                if c1.button(label):
-                    run("UPDATE users SET active=? WHERE id=?", (0 if lookup[uid]["active"] else 1, uid))
-                    st.rerun()
-            new_pw = c2.text_input("New password", type="password", key="reset_pw")
-            if c2.button("Reset password"):
-                if len(new_pw) < 8:
-                    st.error("Min 8 characters.")
-                else:
-                    h, s = hash_pw(new_pw)
-                    run("UPDATE users SET pw_hash=?, salt=? WHERE id=?", (h, s, uid))
-                    st.success("Password reset.")
+        shown = [u for u in users if (rf == "All" or u["role"] == rf)
+                 and (not q or q in f"{u['full_name']} {u['username']} {u['company']}".lower())]
+        if not shown:
+            st.info("No users match.")
+        else:
+            df = pd.DataFrame(shown)
+            df["vendor"] = df.vendor_id.map(lambda v: all_vendors.get(v, "") if pd.notna(v) else "")
+            st.caption(f"{len(shown)} of {len(users)} user(s)")
+            st.dataframe(df.drop(columns=["vendor_id"]), hide_index=True)
+            lookup = {u["id"]: u for u in shown}
+            uid = st.selectbox("Select a user to edit", list(lookup),
+                               format_func=lambda i: f"{lookup[i]['full_name'] or lookup[i]['username']} "
+                                                     f"({lookup[i]['username']}, {lookup[i]['role']})")
+            edit_user_panel(lookup[uid], all_vendors)
+            with st.container(border=True):
+                st.markdown("#### 🔐 Account status & password")
+                c1, c2 = st.columns(2)
+                if uid != st.session_state.user["id"]:
+                    label = "Deactivate" if lookup[uid]["active"] else "Activate"
+                    if c1.button(label, key=f"tog_{uid}"):
+                        run("UPDATE users SET active=? WHERE id=?", (0 if lookup[uid]["active"] else 1, uid))
+                        st.rerun()
+                new_pw = c2.text_input("New password", type="password", key=f"reset_pw_{uid}")
+                if c2.button("Reset password", key=f"rp_{uid}"):
+                    if len(new_pw) < 8:
+                        st.error("Min 8 characters.")
+                    else:
+                        h, s = hash_pw(new_pw)
+                        run("UPDATE users SET pw_hash=?, salt=? WHERE id=?", (h, s, uid))
+                        st.success("Password reset.")
 
 
 # --------------------------------------------------------------------------
@@ -2941,8 +3206,7 @@ def page_hiring_stats():
 
 
 # ---- employees page (manager / admin) ------------------------------------
-def page_employees():
-    header("🧑‍💻", "Employees", "Department, FTE, joining date and resignations")
+def employees_manage():
     emps = run("""SELECT u.*, COALESCE(NULLIF(v.company,''), NULLIF(v.full_name,''), v.username, '-') AS vendor_name
                   FROM users u LEFT JOIN users v ON v.id=u.vendor_id
                   WHERE u.role='employee' AND u.approved=1 ORDER BY u.id""", fetch=True)
@@ -3006,6 +3270,253 @@ def page_employees():
             st.rerun()
 
 
+# ---- bulk import of employees -----------------------------------------------
+HEADER_ALIASES = {
+    "name": "full_name", "employee": "full_name", "employee_name": "full_name",
+    "vendor_name": "vendor", "company": "vendor", "supplier": "vendor",
+    "title": "designation", "job_title": "designation", "role": "designation",
+    "coe": "department", "dept": "department",
+    "joining_date": "join_date", "date_of_joining": "join_date", "doj": "join_date",
+    "resignation_date": "resigned_on", "exit_date": "last_working_day", "lwd": "last_working_day",
+    "reason": "exit_reason",
+}
+OPTIONAL_IMPORT_COLS = ["designation", "department", "fte", "join_date", "username",
+                        "resigned_on", "last_working_day", "exit_reason"]
+
+
+def import_template_csv():
+    return pd.DataFrame([
+        {"full_name": "Asha Verma", "vendor": "Acme Staffing", "designation": "Backend Developer",
+         "department": "Engineering", "fte": 1.0, "join_date": "2025-04-01", "username": "",
+         "resigned_on": "", "last_working_day": "", "exit_reason": ""},
+        {"full_name": "Ravi Nair", "vendor": "Acme Staffing", "designation": "QA Analyst",
+         "department": "Engineering", "fte": 0.5, "join_date": "2024-01-15", "username": "",
+         "resigned_on": "2026-05-01", "last_working_day": "2026-06-01", "exit_reason": "Relocation"},
+    ]).to_csv(index=False)
+
+
+def csv_safe(v):
+    """Stop spreadsheet apps from treating a cell as a formula."""
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
+def vendor_lookup():
+    """{lower-case company / name / username: (vendor id, display name)} for approved vendors."""
+    out = {}
+    for r in run("SELECT id, username, full_name, company FROM users WHERE role='vendor' AND approved=1", fetch=True):
+        display = (r["company"] or "").strip() or (r["full_name"] or "").strip() or r["username"]
+        for key in (r["company"], r["full_name"], r["username"]):
+            if key and key.strip():
+                out[key.strip().lower()] = (r["id"], display)
+    return out
+
+
+def parse_date_cell(v):
+    """-> (ISO date string or '', error message or '')"""
+    v = "" if v is None else str(v).strip()
+    if not v or v.lower() in ("nan", "nat", "none"):
+        return "", ""
+    iso = re.match(r"^\d{4}-\d{1,2}-\d{1,2}", v)          # 2026-05-01 is year-month-day
+    d = pd.to_datetime(v, dayfirst=not iso, errors="coerce")  # 01/05/2026 is read day-first
+    if pd.isna(d):
+        return "", f"invalid date '{v}'"
+    return d.date().isoformat(), ""
+
+
+def validate_import(raw):
+    """Check every row of an uploaded sheet. Returns (rows, fatal_error)."""
+    df = raw.copy()
+    df.columns = [HEADER_ALIASES.get(k, k) for k in
+                  (re.sub(r"[\s\-]+", "_", str(c).strip().lower()) for c in df.columns)]
+    df = df.loc[:, ~df.columns.duplicated()]
+    missing = [c for c in ("full_name", "vendor") if c not in df.columns]
+    if missing:
+        return [], "Missing required column(s): " + ", ".join(missing)
+    for c in OPTIONAL_IMPORT_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df.fillna("").astype(str)
+
+    vendors = vendor_lookup()
+    used = {r["username"].lower() for r in run("SELECT username FROM users", fetch=True)}
+    people = {((r["full_name"] or "").strip().lower(), r["vendor_id"])
+              for r in run("SELECT full_name, vendor_id FROM users WHERE role='employee'", fetch=True)}
+    today = date.today().isoformat()
+    rows = []
+    for i, r in df.iterrows():
+        if not any(str(x).strip() for x in r.values):
+            continue  # skip blank lines
+        errs = []
+        name = r["full_name"].strip()
+        if not name:
+            errs.append("full_name is required")
+        vtxt = r["vendor"].strip()
+        vid, vname = vendors.get(vtxt.lower(), (None, vtxt))
+        if vid is None:
+            errs.append(f"vendor '{vtxt}' not found" if vtxt else "vendor is required")
+
+        fte_txt, fte = r["fte"].strip(), 1.0
+        if fte_txt:
+            try:
+                fte = float(fte_txt)
+                if not 0.1 <= fte <= 1.0:
+                    errs.append("fte must be between 0.1 and 1.0")
+            except ValueError:
+                errs.append(f"invalid fte '{fte_txt}'")
+
+        jd, e1 = parse_date_cell(r["join_date"])
+        ro, e2 = parse_date_cell(r["resigned_on"])
+        ex, e3 = parse_date_cell(r["last_working_day"])
+        errs += [e for e in (e1, e2, e3) if e]
+        jd = jd or today
+        if ex and not ro:
+            ro = ex
+        if ro and not ex:
+            errs.append("last_working_day is required when resigned_on is set")
+        if ro and ex and ex < ro:
+            errs.append("last_working_day is before resigned_on")
+        if vid is not None and name and (name.lower(), vid) in people:
+            errs.append("already exists (same name and vendor)")
+
+        explicit, uname = r["username"].strip(), ""
+        if explicit:
+            if not USERNAME_RE.match(explicit):
+                errs.append("invalid username")
+            elif explicit.lower() in used:
+                errs.append("username already taken")
+            else:
+                uname = explicit
+        elif name:
+            base = re.sub(r"[^a-z0-9._-]", "", name.lower().replace(" ", "."))[:28] or "employee"
+            base = base if len(base) >= 3 else base + "emp"
+            uname, n = base, 2
+            while uname.lower() in used:
+                uname, n = f"{base}{n}", n + 1
+        if not errs:
+            used.add(uname.lower())
+            people.add((name.lower(), vid))
+        rows.append({"row": i + 2, "full_name": name, "vendor_id": vid, "vendor_name": vname,
+                     "username": uname, "designation": r["designation"].strip(),
+                     "department": r["department"].strip(), "fte": fte, "join_date": jd,
+                     "resigned_on": ro, "exit_date": ex, "exit_reason": r["exit_reason"].strip(),
+                     "error": "; ".join(errs)})
+    return rows, None
+
+
+def run_import(rows):
+    """Create a login + employee record for every valid row. Passwords are random and shown once."""
+    creds, failed = [], []
+    for r in rows:
+        pw = secrets.token_urlsafe(9)
+        try:
+            uid = create_user(r["username"], pw, "employee", r["full_name"], r["vendor_name"],
+                              vendor_id=r["vendor_id"], designation=r["designation"],
+                              department=r["department"], fte=r["fte"])
+        except sqlite3.IntegrityError:
+            failed.append(f"Row {r['row']}: username '{r['username']}' was taken meanwhile")
+            continue
+        run("UPDATE users SET join_date=?, resigned_on=?, exit_date=?, exit_reason=? WHERE id=?",
+            (r["join_date"], r["resigned_on"] or None, r["exit_date"] or None, r["exit_reason"] or None, uid))
+        creds.append({"full_name": csv_safe(r["full_name"]), "vendor": csv_safe(r["vendor_name"]),
+                      "username": r["username"], "temporary_password": pw})
+    return {"creds": pd.DataFrame(creds), "failed": failed}
+
+
+def bulk_import_tab():
+    # ---- result screen (shown once after an import) ---------------------------
+    if "bulk_result" in st.session_state:
+        res = st.session_state["bulk_result"]
+        st.success(f"Imported {len(res['creds'])} employee(s).")
+        for msg in res["failed"]:
+            st.warning(msg)
+        if not res["creds"].empty:
+            st.warning("These temporary passwords are shown **only now** and are not stored in readable form. "
+                       "Download the list and share each login securely; people can change their password "
+                       "from the sidebar after signing in.")
+            st.dataframe(res["creds"], hide_index=True)
+            st.download_button("⬇ Download logins (CSV)", res["creds"].to_csv(index=False),
+                               file_name="employee_logins.csv", mime="text/csv")
+        if st.button("Import another file"):
+            del st.session_state["bulk_result"]
+            st.session_state["bulk_n"] = st.session_state.get("bulk_n", 0) + 1
+            st.rerun()
+        return
+
+    st.markdown("Upload a **CSV or Excel** file with one row per employee. Each person gets a login "
+                "linked to their vendor, so vendors can see their approved timesheets.")
+    c1, c2 = st.columns([1, 3])
+    c1.download_button("⬇ Download template", import_template_csv(),
+                       file_name="employee_import_template.csv", mime="text/csv")
+    with c2.expander("Column guide"):
+        st.markdown(
+            "| Column | Required | Notes |\n|---|---|---|\n"
+            "| `full_name` | yes | |\n"
+            "| `vendor` | yes | Must match an approved vendor's company name (see list below) |\n"
+            "| `designation`, `department` | no | Department feeds the Hiring stats COE filter |\n"
+            "| `fte` | no | 0.1 - 1.0, default 1.0 |\n"
+            "| `join_date` | no | `YYYY-MM-DD` preferred, default today. Use real dates for people who joined earlier |\n"
+            "| `username` | no | Auto-created from the name when blank |\n"
+            "| `resigned_on`, `last_working_day`, `exit_reason` | no | For people on notice or who have left - "
+            "they count in Resigned / Attrition. Their login closes after the last working day |")
+        names = sorted({v[1] for v in vendor_lookup().values()})
+        st.caption("Approved vendors you can use: " + (", ".join(names) if names else "none yet - approve vendors first."))
+
+    f = st.file_uploader("CSV or Excel file", type=["csv", "xlsx"], key=f"bulk_file_{st.session_state.get('bulk_n', 0)}")
+    if f is None:
+        return
+    try:
+        if f.name.lower().endswith(".csv"):
+            try:
+                raw = pd.read_csv(f, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                f.seek(0)
+                raw = pd.read_csv(f, dtype=str, keep_default_na=False, encoding="latin-1")
+        else:
+            raw = pd.read_excel(f, dtype=str)
+    except Exception as e:
+        st.error(f"Could not read the file: {e}")
+        return
+    if len(raw) > 2000:
+        st.error("Please import at most 2,000 rows at a time.")
+        return
+
+    rows, fatal = validate_import(raw)
+    if fatal:
+        st.error(fatal)
+        return
+    if not rows:
+        st.info("The file has no data rows.")
+        return
+    ready = [r for r in rows if not r["error"]]
+    bad = [r for r in rows if r["error"]]
+    m = st.columns(3)
+    m[0].metric("Rows in file", len(rows))
+    m[1].metric("Ready to import", len(ready))
+    m[2].metric("With errors", len(bad))
+
+    st.dataframe(pd.DataFrame([{
+        "Row": r["row"], "Employee": r["full_name"], "Vendor": r["vendor_name"], "Username": r["username"],
+        "Title": r["designation"], "Department": r["department"], "FTE": r["fte"], "Joined": r["join_date"],
+        "Last day": r["exit_date"], "Status": ("❌ " + r["error"]) if r["error"] else "✅ Ready",
+    } for r in rows]), hide_index=True)
+    if bad:
+        st.caption("Rows with errors are skipped. Fix them in your file and upload again, "
+                   "or import the ready rows now and add the rest later.")
+    if ready and st.button(f"Import {len(ready)} employee(s)", type="primary"):
+        st.session_state["bulk_result"] = run_import(ready)
+        st.rerun()
+
+
+def page_employees():
+    header("🧑‍💻", "Employees", "Department, FTE, joining dates, resignations and bulk import")
+    tab_manage, tab_import = st.tabs(["Manage", "⬆ Bulk import"])
+    with tab_manage:
+        employees_manage()
+    with tab_import:
+        bulk_import_tab()
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -3028,7 +3539,11 @@ def main():
     if "user" not in st.session_state:
         login_view()
         return
-    user = st.session_state.user
+    fresh = run("SELECT * FROM users WHERE id=? AND active=1 AND approved=1", (st.session_state.user["id"],), fetch=True)
+    if not fresh or (fresh[0].get("exit_date") and fresh[0]["exit_date"] < date.today().isoformat()):
+        st.session_state.clear()   # account was deactivated, removed or has ended
+        st.rerun()
+    user = st.session_state.user = fresh[0]
     msg = st.session_state.pop("flash", None)
     if msg:
         st.toast(msg)
