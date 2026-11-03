@@ -169,15 +169,19 @@ def _img(b64_str: str) -> Image.Image:
         # Strip all whitespace and line breaks
         clean_b64 = "".join(b64_str.split())
         
-        # Automatically fix missing base64 padding
+        # Ensure correct padding
         missing_padding = len(clean_b64) % 4
         if missing_padding:
             clean_b64 += "=" * (4 - missing_padding)
             
         decoded = base64.b64decode(clean_b64)
-        return Image.open(io.BytesIO(decoded))
+        img = Image.open(io.BytesIO(decoded))
+        
+        # Force Pillow to decode the entire image immediately to catch truncation errors
+        img.load()
+        return img
     except Exception:
-        # Fallback to an empty 1x1 transparent image if the base64 string is corrupted
+        # Fallback to an empty 1x1 transparent image if decoding or data loading fails
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
 
 LOGO = _img(_LOGO_B64)
