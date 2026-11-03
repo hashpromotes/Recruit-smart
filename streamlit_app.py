@@ -164,8 +164,21 @@ MDI2LTA1LTE0VDA2OjU2OjA4KzAwOjAwH5X8sQAAAABJRU5ErkJggg==
 
 APP_VERSION = "2026.11 · Gemini Pro Edition"
 
-def _img(b64):
-    return Image.open(io.BytesIO(base64.b64decode("".join(b64.split()))))
+def _img(b64_str: str) -> Image.Image:
+    try:
+        # Strip all whitespace and line breaks
+        clean_b64 = "".join(b64_str.split())
+        
+        # Automatically fix missing base64 padding
+        missing_padding = len(clean_b64) % 4
+        if missing_padding:
+            clean_b64 += "=" * (4 - missing_padding)
+            
+        decoded = base64.b64decode(clean_b64)
+        return Image.open(io.BytesIO(decoded))
+    except Exception:
+        # Fallback to an empty 1x1 transparent image if the base64 string is corrupted
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
 
 LOGO = _img(_LOGO_B64)
 LOGO_WIDE = _img(_LOGO_WIDE_B64)
