@@ -495,7 +495,7 @@ def get_secret(name, default=None):
         return default
 
 def get_gemini_client():
-    api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
+    api_key = "AQ.Ab8RN6LXrM9XhOHV-ptFLyl4AwfLtLsGOENNS7QEJXXtKHsgQQ"
     if not api_key:
         return None
     try:
