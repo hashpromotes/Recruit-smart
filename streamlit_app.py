@@ -500,7 +500,11 @@ def get_gemini_client():
         return None
     try:
         from google import genai
-        return genai.Client(api_key=api_key.strip())
+        key = api_key.strip()
+        # Use Vertex AI Express Mode automatically if an AQ. key is provided
+        if key.startswith("AQ."):
+            return genai.Client(vertexai=True, api_key=key)
+        return genai.Client(api_key=key)
     except Exception as e:
         st.warning(f"Failed to initialize Gemini Client: {e}")
         return None
