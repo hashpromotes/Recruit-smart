@@ -495,19 +495,35 @@ def get_secret(name, default=None):
         return default
 
 def get_gemini_client():
-    api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
-    if not api_key:
+    # Remove any environment variables that force Vertex AI routing
+    for env_var in [
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ]:
+        os.environ.pop(env_var, None)
+
+    raw_key = get_secret("GEMINI_API_KEY")
+    if not raw_key:
+        st.error("GEMINI_API_KEY was not found in Streamlit Secrets.")
         return None
-  
-    # Clean accidental quotes or whitespace from Streamlit Secrets
-    api_key = str(api_key).strip().strip('"').strip("'")
-    
+
+    api_key = str(raw_key).strip().strip('"').strip("'")
+
+    # Quick sanity check on key format
+    if not api_key.startswith("AIza"):
+        st.error(
+            f"Invalid key format (starts with '{api_key[:6]}...'). "
+            "Gemini API keys from Google AI Studio must start with 'AIza'."
+        )
+        return None
+
     try:
         from google import genai
-        # Explicitly set vertexai=False so it uses Google AI Studio instead of aiplatform.googleapis.com
         return genai.Client(api_key=api_key, vertexai=False)
     except Exception as e:
-        st.warning(f"Failed to initialize Gemini Client: {e}")
+        st.error(f"Failed to initialize Gemini Client: {e}")
         return None
       
 def job_text(job):
