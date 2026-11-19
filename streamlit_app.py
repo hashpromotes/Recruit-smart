@@ -563,52 +563,82 @@ def parse_llm(text):
         note += " | Gaps: " + "; ".join(data["gaps"])
     return score, note
 
-def score_gemini(job, resume):
+def score_gemini(job, resume, resume_blob=None, resume_name=""):
     client = get_gemini_client()
     if not client:
-        raise RuntimeError("GEMINI_API_KEY is not set. Add it in environment variables or .streamlit/secrets.toml")
-    from google.genai import types
+        raise RuntimeError("GEMINI_API_KEY is not set. Add it in Streamlit Cloud Secrets.")
     model = get_secret("GEMINI_MODEL", "gemini-4-hydrogen")
-    prompt = build_prompt(job, resume)
-    response = client.models.generate_content(
+
+    if resume.strip():
+        interaction_input = build_prompt(job, resume)
+    elif resume_blob and resume_name.lower().endswith(".pdf"):
+        pdf_b64 = base64.b64encode(resume_blob).decode("utf-8")
+        interaction_input = [
+            {"type": "text", "text": build_prompt(job, "[See attached PDF resume document]")},
+            {
+                "type": "document",
+                "data": pdf_b64,
+                "mime_type": "application/pdf",
+            },
+        ]
+    else:
+        raise ValueError("No readable text or supported PDF file found.")
+
+    interaction = client.interactions.create(
         model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
+        input=interaction_input,
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "score": {"type": "number"},
+                    "summary": {"type": "string"},
+                    "strengths": {"type": "array", "items": {"type": "string"}},
+                    "gaps": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["score", "summary", "strengths", "gaps"],
+            },
+        },
     )
-    return parse_llm(response.text)
+    return parse_llm(interaction.output_text)
 
 def generate_job_description_gemini(prompt_text, company_context=""):
     """Generates structured job details from a manager's high-level prompt using Gemini."""
     client = get_gemini_client()
     if not client:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
-    from google.genai import types
-    model = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+    model = get_secret("GEMINI_MODEL", "gemini-4-hydrogen")
     system_prompt = f"""You are a professional HR Director. Create a high-quality job posting based on the manager's prompt.
 Company / Context: {company_context or 'Enterprise Technology'}
 
-Manager's Request: {prompt_text}
+Manager's Request: {prompt_text}"""
 
-Return STRICT JSON with these keys:
-- "title": Clear professional job title
-- "department": Suggested department or division
-- "employment_type": One of: "Full-time", "Contract", "Part-time", "Internship"
-- "experience": Clear experience string (e.g. "4-7 years")
-- "required_skills": Comma-separated list of mandatory skills
-- "description": Comprehensive, professional markdown job description with overview, responsibilities, and qualifications."""
-
-    response = client.models.generate_content(
+    interaction = client.interactions.create(
         model=model,
-        contents=system_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.4,
-        ),
+        input=system_prompt,
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "department": {"type": "string"},
+                    "employment_type": {
+                        "type": "string",
+                        "enum": ["Full-time", "Contract", "Part-time", "Internship"],
+                    },
+                    "experience": {"type": "string"},
+                    "required_skills": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["title", "department", "employment_type", "experience", "required_skills", "description"],
+            },
+        },
     )
-    match = re.search(r"\{.*\}", response.text, re.S)
+    match = re.search(r"\{.*\}", interaction.output_text, re.S)
     if not match:
         raise ValueError("Could not parse AI response.")
     return json.loads(match.group(0))
@@ -640,20 +670,27 @@ def score_openai(job, resume):
     return parse_llm(r.choices[0].message.content)
 
 METHODS = {
-    "Gemini 2.5 Flash (Google)": score_gemini,
+    "Gemini 4 Hydrogen (Google)": score_gemini,
     "Keyword skills match": score_keywords,
     "TF-IDF similarity": score_tfidf,
     "Claude (Anthropic)": score_claude,
     "GPT (OpenAI)": score_openai,
 }
 
-def ai_evaluate(job, resume, methods):
-    if not resume.strip():
+def ai_evaluate(job, resume, methods, resume_blob=None, resume_name=""):
+    has_pdf_blob = bool(resume_blob and resume_name.lower().endswith(".pdf"))
+    if not resume.strip() and not has_pdf_blob:
         return 0.0, [{"method": "-", "score": 0, "note": "No readable text in resume"}]
     results = []
     for m in methods:
         try:
-            s, note = METHODS[m](job, resume)
+            if m == "Gemini 4 Hydrogen (Google)":
+                s, note = score_gemini(job, resume, resume_blob=resume_blob, resume_name=resume_name)
+            else:
+                if not resume.strip():
+                    results.append({"method": m, "score": None, "note": "Skipped: image-based PDF requires Gemini"})
+                    continue
+                s, note = METHODS[m](job, resume)
             results.append({"method": m, "score": s, "note": note})
         except Exception as e:
             results.append({"method": m, "score": None, "note": f"Error: {e}"})
@@ -963,7 +1000,7 @@ def page_review():
 
     with st.expander("🤖 Automated AI Screening & Scoring Options", expanded=True):
         c_m, c_opt = st.columns([3, 1])
-        default_methods = ["Gemini 2.5 Flash (Google)"] if get_secret("GEMINI_API_KEY") else ["Keyword skills match", "TF-IDF similarity"]
+        default_methods = ["Gemini 4 Hydrogen (Google)"] if get_secret("GEMINI_API_KEY") else ["Keyword skills match", "TF-IDF similarity"]
         methods = c_m.multiselect("Active AI Evaluation Engines", list(METHODS), default=default_methods)
         rescore = c_opt.checkbox("Re-score evaluated profiles", value=False)
         if st.button("Run AI Screening", type="primary", disabled=not methods):
@@ -974,8 +1011,19 @@ def page_review():
                 bar = st.progress(0.0, text="Evaluating resumes with AI...")
                 failed = 0
                 for i, c in enumerate(targets):
-                    text = run("SELECT resume_text FROM candidates WHERE id=?", (c["id"],), fetch=True)[0]["resume_text"] or ""
-                    score, details = ai_evaluate(job, text, methods)
+                    row = run(
+                        "SELECT resume_text, resume_blob, resume_name FROM candidates WHERE id=?",
+                        (c["id"],),
+                        fetch=True,
+                    )[0]
+                    text = row["resume_text"] or ""
+                    score, details = ai_evaluate(
+                        job,
+                        text,
+                        methods,
+                        resume_blob=row["resume_blob"],
+                        resume_name=row["resume_name"] or "",
+                    )
                     if score is None:
                         failed += 1
                     else:
