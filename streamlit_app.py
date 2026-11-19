@@ -568,7 +568,7 @@ def score_gemini(job, resume):
     if not client:
         raise RuntimeError("GEMINI_API_KEY is not set. Add it in environment variables or .streamlit/secrets.toml")
     from google.genai import types
-    model = get_secret("GEMINI_MODEL", ""gemini-4-hydrogen")
+    model = get_secret("GEMINI_MODEL", "gemini-4-hydrogen")
     prompt = build_prompt(job, resume)
     response = client.models.generate_content(
         model=model,
