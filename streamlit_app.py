@@ -501,7 +501,6 @@ def get_gemini_client():
     try:
         from google import genai
         key = api_key.strip()
-        # Use Vertex AI Express Mode automatically if an AQ. key is provided
         if key.startswith("AQ."):
             return genai.Client(vertexai=True, api_key=key)
         return genai.Client(api_key=key)
@@ -571,82 +570,62 @@ def score_gemini(job, resume, resume_blob=None, resume_name=""):
     client = get_gemini_client()
     if not client:
         raise RuntimeError("GEMINI_API_KEY is not set. Add it in Streamlit Cloud Secrets.")
-    model = get_secret("GEMINI_MODEL", "gemini-4-hydrogen")
+    from google.genai import types
+    model = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
 
     if resume.strip():
-        interaction_input = build_prompt(job, resume)
+        contents = build_prompt(job, resume)
     elif resume_blob and resume_name.lower().endswith(".pdf"):
-        pdf_b64 = base64.b64encode(resume_blob).decode("utf-8")
-        interaction_input = [
-            {"type": "text", "text": build_prompt(job, "[See attached PDF resume document]")},
-            {
-                "type": "document",
-                "data": pdf_b64,
-                "mime_type": "application/pdf",
-            },
+        contents = [
+            types.Part.from_bytes(data=resume_blob, mime_type="application/pdf"),
+            build_prompt(job, "[See attached PDF resume document]"),
         ]
     else:
         raise ValueError("No readable text or supported PDF file found.")
 
-    interaction = client.interactions.create(
+    response = client.models.generate_content(
         model=model,
-        input=interaction_input,
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "score": {"type": "number"},
-                    "summary": {"type": "string"},
-                    "strengths": {"type": "array", "items": {"type": "string"}},
-                    "gaps": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["score", "summary", "strengths", "gaps"],
-            },
-        },
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+        ),
     )
-    return parse_llm(interaction.output_text)
+    return parse_llm(response.text)
 
 def generate_job_description_gemini(prompt_text, company_context=""):
     """Generates structured job details from a manager's high-level prompt using Gemini."""
     client = get_gemini_client()
     if not client:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
-    model = get_secret("GEMINI_MODEL", "gemini-4-hydrogen")
+    from google.genai import types
+    model = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
     system_prompt = f"""You are a professional HR Director. Create a high-quality job posting based on the manager's prompt.
 Company / Context: {company_context or 'Enterprise Technology'}
 
-Manager's Request: {prompt_text}"""
+Manager's Request: {prompt_text}
 
-    interaction = client.interactions.create(
+Return STRICT JSON with these keys:
+- "title": Clear professional job title
+- "department": Suggested department or division
+- "employment_type": One of: "Full-time", "Contract", "Part-time", "Internship"
+- "experience": Clear experience string (e.g. "4-7 years")
+- "required_skills": Comma-separated list of mandatory skills
+- "description": Comprehensive, professional markdown job description with overview, responsibilities, and qualifications."""
+
+    response = client.models.generate_content(
         model=model,
-        input=system_prompt,
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "department": {"type": "string"},
-                    "employment_type": {
-                        "type": "string",
-                        "enum": ["Full-time", "Contract", "Part-time", "Internship"],
-                    },
-                    "experience": {"type": "string"},
-                    "required_skills": {"type": "string"},
-                    "description": {"type": "string"},
-                },
-                "required": ["title", "department", "employment_type", "experience", "required_skills", "description"],
-            },
-        },
+        contents=system_prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.4,
+        ),
     )
-    match = re.search(r"\{.*\}", interaction.output_text, re.S)
+    match = re.search(r"\{.*\}", response.text, re.S)
     if not match:
         raise ValueError("Could not parse AI response.")
     return json.loads(match.group(0))
-
+  
 def score_claude(job, resume):
     key = get_secret("ANTHROPIC_API_KEY")
     if not key:
@@ -674,7 +653,7 @@ def score_openai(job, resume):
     return parse_llm(r.choices[0].message.content)
 
 METHODS = {
-    "Gemini 4 Hydrogen (Google)": score_gemini,
+    "Gemini 2.5 Flash (Google)": score_gemini,
     "Keyword skills match": score_keywords,
     "TF-IDF similarity": score_tfidf,
     "Claude (Anthropic)": score_claude,
@@ -688,7 +667,7 @@ def ai_evaluate(job, resume, methods, resume_blob=None, resume_name=""):
     results = []
     for m in methods:
         try:
-            if m == "Gemini 4 Hydrogen (Google)":
+            if m == "Gemini 2.5 Flash (Google)":
                 s, note = score_gemini(job, resume, resume_blob=resume_blob, resume_name=resume_name)
             else:
                 if not resume.strip():
@@ -1004,7 +983,7 @@ def page_review():
 
     with st.expander("🤖 Automated AI Screening & Scoring Options", expanded=True):
         c_m, c_opt = st.columns([3, 1])
-        default_methods = ["Gemini 4 Hydrogen (Google)"] if get_secret("GEMINI_API_KEY") else ["Keyword skills match", "TF-IDF similarity"]
+        default_methods = ["Gemini 2.5 Flash (Google)"] if get_secret("GEMINI_API_KEY") else ["Keyword skills match", "TF-IDF similarity"]
         methods = c_m.multiselect("Active AI Evaluation Engines", list(METHODS), default=default_methods)
         rescore = c_opt.checkbox("Re-score evaluated profiles", value=False)
         if st.button("Run AI Screening", type="primary", disabled=not methods):
