@@ -10,5 +10,5 @@ maxUploadSize = 10
 
 [browser]
 gatherUsageStats = false
-GEMINI_API_KEY = "your-gemini-api-key"
+GEMINI_API_KEY = "AQ.Ab8RN6LXrM9XhOHV-ptFLyl4AwfLtLsGOENNS7QEJXXtKHsgQQ"
 # Optional: GEMINI_MODEL = "gemini-2.5-flash"
