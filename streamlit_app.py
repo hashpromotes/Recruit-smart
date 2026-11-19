@@ -495,15 +495,17 @@ def get_secret(name, default=None):
         return default
 
 def get_gemini_client():
-    api_key = get_secret("GEMINI_API_KEY")
-    if not api_key:
+    raw_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
+    if not raw_key:
         return None
+    
+    # Clean accidental whitespace or surrounding quotes from Streamlit Secrets
+    api_key = raw_key.strip().strip('"').strip("'")
+    
     try:
         from google import genai
-        key = api_key.strip()
-        if key.startswith("AQ."):
-            return genai.Client(vertexai=True, api_key=key)
-        return genai.Client(api_key=key)
+        # Explicitly set vertexai=False so standard AI Studio keys work
+        return genai.Client(api_key=api_key, vertexai=False)
     except Exception as e:
         st.warning(f"Failed to initialize Gemini Client: {e}")
         return None
