@@ -495,16 +495,16 @@ def get_secret(name, default=None):
         return default
 
 def get_gemini_client():
-    api_key = AQ.Ab8RN6LXrM9XhOHV-ptFLyl4AwfLtLsGOENNS7QEJXXtKHsgQQ
+    api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
         return None
     try:
         from google import genai
-        return genai.Client(api_key=api_key)
+        return genai.Client(api_key=api_key.strip())
     except Exception as e:
         st.warning(f"Failed to initialize Gemini Client: {e}")
         return None
-
+      
 def job_text(job):
     return " ".join(filter(None, [job["title"], job["required_skills"], job["experience"], job["description"]]))
 
